@@ -65,6 +65,7 @@ def download_video(
         "-o", output_template,
         "--no-playlist",
         "--max-filesize", "50M",
+        "--extractor-args", "youtube:player_client=android,web",
         url,
     ]
 
