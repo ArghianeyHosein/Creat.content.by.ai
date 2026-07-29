@@ -1,29 +1,70 @@
 """
-سرویس کوچیک دانلود ویدیو (برای اجرا روی Render)
-------------------------------------------------
-این سرویس یه لینک یوتیوب می‌گیره، با yt-dlp خودش دانلودش می‌کنه، و مستقیم
-بایت‌های فایل رو برمی‌گردونه. این‌جوری n8n Cloud دیگه لازم نیست به لینک
-مستقیم CDN گوگل (که قفل IP/سشنه) وصل بشه؛ فقط به این سرور خودت وصل می‌شه.
+سرویس دانلود ویدیو/عکس (یوتیوب + اینستاگرام) — برای اجرا روی Render
+--------------------------------------------------------------------
+این سرویس یه لینک (یوتیوب یا اینستاگرام) می‌گیره، با yt-dlp خودش دانلودش
+می‌کنه، و مستقیم بایت‌های فایل رو برمی‌گردونه. این‌جوری n8n Cloud دیگه لازم
+نیست به لینک مستقیم CDN (که قفل IP/سشنه) وصل بشه؛ فقط به این سرور خودت
+وصل می‌شه.
 
-نکته‌ی امنیتی: یه کلید ساده (X-API-Key) گذاشتم تا هرکسی که آدرس این سرویس رو
-پیدا کنه نتونه ازش سوءاستفاده کنه (چون هر دانلود، پهنای‌باند/زمان مصرف می‌کنه).
+نکته‌ی امنیتی: یه کلید ساده (X-API-Key) گذاشتیم تا هرکسی که آدرس این سرویس
+رو پیدا کنه نتونه ازش سوءاستفاده کنه (چون هر دانلود، پهنای‌باند/زمان مصرف
+می‌کنه).
+
+نکته‌ی کوکی: برای هر پلتفرم، یه Environment Variable جدا باید ست بشه
+(چون کوکی‌های یوتیوب و اینستاگرام کاملاً مستقل و مربوط به دو دامنه‌ی
+متفاوتن):
+  - YOUTUBE_COOKIES_B64
+  - INSTAGRAM_COOKIES_B64
+هرکدوم که ست نشده باشن، سرویس بدون کوکی (anonymous) تلاش می‌کنه —
+یعنی اگه فقط کوکی اینستاگرام رو داری، یوتیوب همچنان (با همون مشکل قبلی)
+بدون‌کوکی امتحان می‌شه.
 """
 
 import os
 import uuid
+import base64
 import subprocess
+import mimetypes
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from fastapi.responses import FileResponse
 
-app = FastAPI(title="YouTube CC Downloader")
+app = FastAPI(title="Media Downloader (YouTube + Instagram)")
 
 # کلید امنیتی از متغیر محیطی خونده می‌شه (تو تنظیمات Render ست می‌کنیم)
 API_KEY = os.environ.get("API_KEY", "")
 
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+COOKIES_DIR = Path("/tmp/cookies")
+COOKIES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def setup_cookies(env_var_name: str, filename: str) -> Optional[str]:
+    """
+    کوکی base64-شده رو از Environment Variable می‌خونه، دیکد می‌کنه، و
+    توی /tmp به یه فایل کوکی (فرمت Netscape) می‌نویسه.
+    اگه متغیر ست نشده باشه، None برمی‌گردونه (یعنی بدون کوکی تلاش می‌کنیم).
+    """
+    b64_value = os.environ.get(env_var_name, "")
+    if not b64_value:
+        return None
+    try:
+        raw = base64.b64decode(b64_value)
+    except Exception:
+        return None
+    path = COOKIES_DIR / filename
+    path.write_bytes(raw)
+    return str(path)
+
+
+# کوکی‌ها فقط یه‌بار، موقع بالا اومدن سرویس آماده می‌شن (نه هر درخواست —
+# چون دیکد/نوشتن فایل کار اضافیه که نیازی نیست هر بار تکرار بشه)
+YOUTUBE_COOKIES_PATH = setup_cookies("YOUTUBE_COOKIES_B64", "youtube_cookies.txt")
+INSTAGRAM_COOKIES_PATH = setup_cookies("INSTAGRAM_COOKIES_B64", "instagram_cookies.txt")
 
 
 def cleanup_file(path: Path):
@@ -33,6 +74,53 @@ def cleanup_file(path: Path):
             path.unlink()
     except Exception:
         pass
+
+
+def detect_platform(url: str) -> str:
+    if "youtube.com" in url or "youtu.be" in url:
+        return "youtube"
+    if "instagram.com" in url:
+        return "instagram"
+    return "unknown"
+
+
+def build_command(platform: str, url: str, output_template: str) -> list:
+    if platform == "youtube":
+        cmd = [
+            "yt-dlp",
+            "-f", "best[ext=mp4][filesize<50M]/best[ext=mp4]/best",
+            "-o", output_template,
+            "--no-playlist",
+            "--max-filesize", "50M",
+            "--extractor-args", "youtube:player_client=android,web",
+            url,
+        ]
+        if YOUTUBE_COOKIES_PATH:
+            cmd += ["--cookies", YOUTUBE_COOKIES_PATH]
+        return cmd
+
+    if platform == "instagram":
+        # پست اینستاگرام می‌تونه ویدیو یا عکس باشه، پس فرمت رو به mp4 محدود نمی‌کنیم
+        cmd = [
+            "yt-dlp",
+            "-f", "best[filesize<50M]/best",
+            "-o", output_template,
+            "--no-playlist",
+            "--max-filesize", "50M",
+            url,
+        ]
+        if INSTAGRAM_COOKIES_PATH:
+            cmd += ["--cookies", INSTAGRAM_COOKIES_PATH]
+        return cmd
+
+    raise HTTPException(status_code=400, detail="Unsupported URL (only YouTube and Instagram)")
+
+
+def guess_media_type(file_path: Path) -> str:
+    """از روی پسوند واقعی فایل دانلودشده، media_type درست رو حدس می‌زنه
+    (چون دیگه فرض ثابت 'همه‌چیز ویدیوعه' درست نیست — اینستاگرام می‌تونه عکس بده)"""
+    mime, _ = mimetypes.guess_type(file_path.name)
+    return mime or "application/octet-stream"
 
 
 @app.get("/")
@@ -51,23 +139,14 @@ def download_video(
     if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    if not url or ("youtube.com" not in url and "youtu.be" not in url):
-        raise HTTPException(status_code=400, detail="Only YouTube URLs are supported")
+    platform = detect_platform(url)
+    if platform == "unknown":
+        raise HTTPException(status_code=400, detail="Only YouTube and Instagram URLs are supported")
 
     file_id = str(uuid.uuid4())
     output_template = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
-    # فرمت: یه فایل mp4 که هم تصویر هم صدا توش mux شده (تا نیازی به ffmpeg نداشته باشیم)
-    # محدودیت حجم: حداکثر ۵۰ مگابایت، تا با پلن رایگان Render/Backblaze سازگار بمونه
-    cmd = [
-        "yt-dlp",
-        "-f", "best[ext=mp4][filesize<50M]/best[ext=mp4]/best",
-        "-o", output_template,
-        "--no-playlist",
-        "--max-filesize", "50M",
-        "--extractor-args", "youtube:player_client=android,web",
-        url,
-    ]
+    cmd = build_command(platform, url, output_template)
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=180)
@@ -86,7 +165,7 @@ def download_video(
 
     return FileResponse(
         path=file_path,
-        media_type="video/mp4",
+        media_type=guess_media_type(file_path),
         filename=file_path.name,
         background=background_tasks,
     )
