@@ -30,6 +30,8 @@ import mimetypes
 from pathlib import Path
 from typing import Optional
 
+import boto3
+from botocore.client import Config as BotoConfig
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Query
 from fastapi.responses import FileResponse
 
@@ -37,6 +39,39 @@ app = FastAPI(title="Media Downloader (YouTube + Instagram)")
 
 # کلید امنیتی از متغیر محیطی خونده می‌شه (تو تنظیمات Render ست می‌کنیم)
 API_KEY = os.environ.get("API_KEY", "")
+
+# اطلاعات بک‌بلیز — برای ساخت لینک موقت دانلود (presigned URL) از فایل‌های
+# private. این‌ها رو باید توی Environment Variables سرویس Render ست کنی:
+#   B2_KEY_ID          -> Access Key ID بک‌بلیز
+#   B2_APPLICATION_KEY  -> Secret Access Key بک‌بلیز
+#   B2_ENDPOINT         -> مثلا https://s3.us-east-005.backblazeb2.com
+#   B2_BUCKET_NAME      -> مثلا Creator-content-by-AI
+B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
+B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
+B2_ENDPOINT = os.environ.get("B2_ENDPOINT", "")
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "")
+
+_s3_client = None
+
+
+def get_s3_client():
+    """S3 client رو فقط یه‌بار می‌سازه (نه هر درخواست) و برای درخواست‌های بعدی
+    از همون استفاده می‌کنه."""
+    global _s3_client
+    if _s3_client is None:
+        if not (B2_KEY_ID and B2_APPLICATION_KEY and B2_ENDPOINT):
+            raise HTTPException(
+                status_code=500,
+                detail="Backblaze credentials not configured (B2_KEY_ID / B2_APPLICATION_KEY / B2_ENDPOINT)",
+            )
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=B2_ENDPOINT,
+            aws_access_key_id=B2_KEY_ID,
+            aws_secret_access_key=B2_APPLICATION_KEY,
+            config=BotoConfig(signature_version="s3v4"),
+        )
+    return _s3_client
 
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -247,3 +282,35 @@ def get_info(
         "like_count": info.get("like_count"),
         "comment_count": info.get("comment_count"),
     }
+
+
+@app.get("/presign")
+def get_presigned_url(
+    key: str = Query(..., description="مسیر فایل داخل باکت، مثلا instagram/197373549-123.mp4"),
+    expires_in: int = Query(3600, ge=60, le=604800, description="مدت اعتبار لینک به ثانیه (پیش‌فرض ۱ ساعت، حداکثر ۷ روز)"),
+    x_api_key: str = Header(default=""),
+):
+    """
+    برای فایل‌های private روی بک‌بلیز، یه لینک موقت (presigned URL) می‌سازه
+    که تا expires_in ثانیه دیگه معتبره و بدون نیاز به احراز هویت اضافه
+    قابل دانلوده. مقدار key همون file_key ایه که توی data_collection
+    ذخیره کردیم.
+    """
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    if not B2_BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="B2_BUCKET_NAME is not configured")
+
+    client = get_s3_client()
+
+    try:
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": B2_BUCKET_NAME, "Key": key},
+            ExpiresIn=expires_in,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not generate presigned URL: {e}")
+
+    return {"url": url, "expires_in": expires_in}
