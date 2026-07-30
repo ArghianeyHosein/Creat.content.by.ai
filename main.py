@@ -243,4 +243,7 @@ def get_info(
         "hashtags": hashtags,
         "title": info.get("title"),
         "uploader": info.get("uploader"),
+        "view_count": info.get("view_count"),
+        "like_count": info.get("like_count"),
+        "comment_count": info.get("comment_count"),
     }
