@@ -21,6 +21,8 @@
 """
 
 import os
+import re
+import json
 import uuid
 import base64
 import subprocess
@@ -28,7 +30,7 @@ import mimetypes
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Query
 from fastapi.responses import FileResponse
 
 app = FastAPI(title="Media Downloader (YouTube + Instagram)")
@@ -84,6 +86,14 @@ def detect_platform(url: str) -> str:
     return "unknown"
 
 
+def cookies_for_platform(platform: str) -> Optional[str]:
+    if platform == "youtube":
+        return YOUTUBE_COOKIES_PATH
+    if platform == "instagram":
+        return INSTAGRAM_COOKIES_PATH
+    return None
+
+
 def build_command(platform: str, url: str, output_template: str) -> list:
     if platform == "youtube":
         cmd = [
@@ -114,6 +124,28 @@ def build_command(platform: str, url: str, output_template: str) -> list:
         return cmd
 
     raise HTTPException(status_code=400, detail="Unsupported URL (only YouTube and Instagram)")
+
+
+def build_info_command(platform: str, url: str) -> list:
+    """
+    مثل build_command ولی به‌جای دانلود واقعی فایل، فقط متادیتا (کپشن،
+    هشتگ و ...) رو به‌صورت JSON از yt-dlp می‌گیره. --skip-download یعنی
+    هیچ فایلی دانلود نمی‌شه، فقط اطلاعاتش استخراج می‌شه (سریع و کم‌مصرف).
+    """
+    if platform not in ("youtube", "instagram"):
+        raise HTTPException(status_code=400, detail="Unsupported URL (only YouTube and Instagram)")
+
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--dump-json",
+        "--no-playlist",
+        url,
+    ]
+    cookies_path = cookies_for_platform(platform)
+    if cookies_path:
+        cmd += ["--cookies", cookies_path]
+    return cmd
 
 
 def guess_media_type(file_path: Path) -> str:
@@ -169,3 +201,46 @@ def download_video(
         filename=file_path.name,
         background=background_tasks,
     )
+
+
+@app.get("/info")
+def get_info(
+    url: str = Query(...),
+    x_api_key: str = Header(default=""),
+):
+    """
+    فقط متادیتای محتوا (کپشن، هشتگ) رو برمی‌گردونه، بدون دانلود فایل.
+    برای اضافه‌کردن این اطلاعات به data_collection توی Supabase استفاده می‌شه.
+    """
+    # چک کلید امنیتی — دقیقاً همون منطق /download
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    platform = detect_platform(url)
+    if platform == "unknown":
+        raise HTTPException(status_code=400, detail="Only YouTube and Instagram URLs are supported")
+
+    cmd = build_info_command(platform, url)
+
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=502, detail=f"yt-dlp failed: {e.stderr[-500:]}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Fetching info timed out")
+
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Could not parse yt-dlp output")
+
+    caption = info.get("description") or ""
+    hashtags = re.findall(r"#(\w+)", caption)
+
+    return {
+        "platform": platform,
+        "caption": caption,
+        "hashtags": hashtags,
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+    }
