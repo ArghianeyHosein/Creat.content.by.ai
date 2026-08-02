@@ -1,0 +1,8 @@
+# این خط‌ها رو به requirements.txt سرویس فعلی اضافه کن (نه جایگزین کل فایل)
+faster-whisper
+pyannote.audio
+edge-tts
+mistralai
+httpx
+librosa
+numpy
