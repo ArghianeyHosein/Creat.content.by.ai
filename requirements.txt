@@ -3,8 +3,8 @@ uvicorn[standard]==0.30.6
 yt-dlp==2026.07.04
 boto3
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.6.0+cpu
-torchaudio==2.6.0+cpu
+torch==2.9.0+cpu
+torchaudio==2.9.0+cpu
 pyannote.audio
 faster-whisper
 edge-tts
