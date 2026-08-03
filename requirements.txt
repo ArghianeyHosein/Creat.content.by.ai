@@ -2,18 +2,6 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 yt-dlp==2026.07.04
 boto3
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.9.0+cpu
-torchaudio==2.9.0+cpu
-pyannote.audio
-faster-whisper
-edge-tts
-mistralai
-httpx
-librosa
-numpy
-# این خط‌ها رو به requirements.txt سرویس فعلی اضافه کن (نه جایگزین کل فایل)
-# نکته: pyannote.audio و torch دیگه لازم نیستن (به‌خاطر محدودیت حافظه‌ی پلن رایگان حذف شدن)
 faster-whisper
 edge-tts
 mistralai
