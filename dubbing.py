@@ -1,13 +1,16 @@
 """
 ماژول دوبله خودکار ویدیو
-مراحل: جدا کردن صدا -> تشخیص گوینده و جنسیت -> تبدیل به متن -> ترجمه -> TTS -> ترکیب نهایی
+مراحل: جدا کردن صدا -> تشخیص جنسیت غالب صدا -> تبدیل به متن -> ترجمه -> TTS -> ترکیب نهایی
+
+نسخه‌ی سبک (بدون pyannote/torch) برای سازگاری با پلن رایگان Render (۵۱۲ مگابایت RAM).
+برای فعال کردن تشخیص چند-گوینده/چند-جنسیت در آینده (وقتی پلن آپگرید شد)،
+به فایل dubbing_prompt.md مراجعه کن.
 
 نحوه‌ی اضافه کردن به سرویس فعلی:
     from dubbing import router as dubbing_router
     app.include_router(dubbing_router, prefix="/dub")
 
 Environment Variables مورد نیاز (باید روی Render ست بشن):
-    HF_TOKEN        - توکن Hugging Face برای دانلود مدل‌های pyannote
     MISTRAL_API_KEY - برای ترجمه متن (همونی که از قبل داری)
 """
 
@@ -84,39 +87,21 @@ def extract_audio(video_path: Path, audio_path: Path) -> None:
         raise RuntimeError(f"ffmpeg extract failed: {result.stderr}")
 
 
-def diarize_and_detect_gender(audio_path: Path) -> list[dict]:
+def detect_dominant_gender(audio_path: Path) -> str:
     """
-    خروجی: لیستی از segmentها به شکل
-    [{"start": 0.0, "end": 3.2, "speaker": "SPEAKER_00", "gender": "male"}, ...]
+    نسخه‌ی سبک (بدون pyannote/torch) برای پلن رایگان Render با ۵۱۲ مگابایت RAM.
+    به‌جای تفکیک گوینده‌ها، یک جنسیت غالب برای کل فایل صوتی تشخیص می‌ده
+    (میانه‌ی pitch روی کل صدا). محدودیت: نمی‌تونه چند گوینده با جنسیت متفاوت
+    رو توی یک ویدیو جدا کنه — برای اون قابلیت به فایل dubbing_prompt.md مراجعه کن.
     """
-    from pyannote.audio import Pipeline
     import numpy as np
     import librosa
 
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", token=HF_TOKEN
-    )
-    diarization = pipeline(str(audio_path))
-
     y, sr = librosa.load(str(audio_path), sr=16000)
-    segments = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        start_sample = int(turn.start * sr)
-        end_sample = int(turn.end * sr)
-        chunk = y[start_sample:end_sample]
-        if len(chunk) < sr * 0.1:  # قطعه‌ی خیلی کوتاه، رد شو
-            continue
-        f0 = librosa.yin(chunk, fmin=65, fmax=400, sr=sr)
-        f0 = f0[f0 > 0]
-        pitch = float(np.median(f0)) if len(f0) else 165.0
-        gender = "male" if pitch < 165 else "female"
-        segments.append({
-            "start": turn.start,
-            "end": turn.end,
-            "speaker": speaker,
-            "gender": gender,
-        })
-    return segments
+    f0 = librosa.yin(y, fmin=65, fmax=400, sr=sr)
+    f0 = f0[f0 > 0]
+    pitch = float(np.median(f0)) if len(f0) else 165.0
+    return "male" if pitch < 165 else "female"
 
 
 def transcribe(audio_path: Path) -> tuple[str, str]:
@@ -174,8 +159,6 @@ async def process_dubbing(req: DubRequest):
     نکته: چون ویدیوها حداکثر یک دقیقه‌ان و فرکانس اجرا حدود یک بار در ساعت،
     این endpoint به‌صورت synchronous (بدون صف جدا) کل کار رو انجام می‌ده.
     """
-    if not HF_TOKEN:
-        raise HTTPException(500, "HF_TOKEN تنظیم نشده روی سرویس")
     if not MISTRAL_API_KEY:
         raise HTTPException(500, "MISTRAL_API_KEY تنظیم نشده روی سرویس")
 
@@ -216,16 +199,8 @@ async def process_dubbing(req: DubRequest):
         # ۳. جدا کردن صدا
         extract_audio(video_path, audio_path)
 
-        # ۴. تشخیص گوینده‌ها و جنسیت (فعلاً برای انتخاب صدای TTS غالب استفاده می‌شه)
-        segments = diarize_and_detect_gender(audio_path)
-        # اگه چند گوینده داشتیم، جنسیت غالب (بر اساس مجموع مدت زمان) رو انتخاب می‌کنیم
-        gender = "male"
-        if segments:
-            from collections import defaultdict
-            durations = defaultdict(float)
-            for s in segments:
-                durations[s["gender"]] += s["end"] - s["start"]
-            gender = max(durations, key=durations.get)
+        # ۴. تشخیص جنسیت غالب صدا (نسخه‌ی سبک بدون pyannote - رجوع کن به dubbing_prompt.md)
+        gender = detect_dominant_gender(audio_path)
 
         # ۵. تبدیل صدا به متن
         original_text, detected_lang = transcribe(audio_path)
