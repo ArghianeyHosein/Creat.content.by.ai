@@ -22,6 +22,7 @@ import asyncio
 import subprocess
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -325,6 +326,19 @@ async def get_dubbing_status(job_id: str):
     if job is None:
         raise HTTPException(404, "job_id پیدا نشد")
     return job
+
+
+@router.get("/download/{job_id}")
+async def download_dubbed_video(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job_id پیدا نشد")
+    if job.status != "done" or not job.result or not job.result.local_output_path:
+        raise HTTPException(409, f"فایل هنوز آماده نیست (وضعیت فعلی: {job.status})")
+    path = Path(job.result.local_output_path)
+    if not path.exists():
+        raise HTTPException(410, "فایل روی دیسک سرویس دیگه وجود نداره (احتمالا سرویس ری‌استارت شده)")
+    return FileResponse(path, media_type="video/mp4", filename=f"dubbed_{job.content_id}.mp4")
     # توجه: job_dir رو عمداً پاک نکردیم چون آپلود به بک‌بلیز در مرحله‌ی بعدی (n8n)
     # از local_output_path استفاده می‌کنه. باید بعد از آپلود موفق، یه endpoint یا
     # cronjob جداگانه برای پاک‌سازی /tmp/dubbing و JOBS اضافه بشه.
