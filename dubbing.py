@@ -33,6 +33,10 @@ MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 WORK_DIR = Path("/tmp/dubbing")
 WORK_DIR.mkdir(exist_ok=True)
 
+# وضعیت job ها توی حافظه نگه‌داری میشه (چون فرکانس اجرا کمه - حدود ۱ در ساعت -
+# نیازی به دیتابیس جدا برای این نیست؛ سرویس تا وقتی جواب نهایی رو نگرفتی نمی‌خوابه)
+JOBS: dict[str, "JobStatus"] = {}
+
 # ---------- مدل‌های ورودی/خروجی ----------
 
 class DubRequest(BaseModel):
@@ -49,6 +53,20 @@ class DubResult(BaseModel):
     skipped: bool = False
     skip_reason: str | None = None
     skip_reason_en: str | None = None   # نسخه انگلیسی، برای دیدن راحت توی ترمینال‌هایی که فونت فارسی ندارن
+
+
+class JobStatus(BaseModel):
+    job_id: str
+    content_id: str
+    status: str   # "processing" | "done" | "failed"
+    result: DubResult | None = None
+    error: str | None = None
+
+
+class JobAccepted(BaseModel):
+    job_id: str
+    content_id: str
+    status: str = "processing"
 
 
 # ---------- توابع کمکی هر مرحله ----------
@@ -252,25 +270,53 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
     )
 
 
-@router.post("/process", response_model=DubResult)
+def _run_dubbing_job(job_id: str, req: "DubRequest", job_dir: Path) -> None:
+    """
+    این تابع توی یه ترد پس‌زمینه (background thread) اجرا میشه، کاملاً جدا از
+    درخواست HTTP اصلی. نتیجه رو توی JOBS[job_id] ذخیره می‌کنه تا endpoint وضعیت
+    بتونه بعداً بخونتش. چون هیچ اتصال HTTPای رو باز نگه نمی‌داره، محدودیت
+    timeout پروکسی Render دیگه مشکلی ایجاد نمی‌کنه.
+    """
+    try:
+        result = _run_dubbing_pipeline(req, job_dir)
+        JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="done", result=result)
+    except Exception as e:
+        logger.exception(f"[{req.content_id}] خطا در فرآیند دوبله")
+        JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="failed", error=str(e))
+
+
+@router.post("/process", response_model=JobAccepted, status_code=202)
 async def process_dubbing(req: DubRequest):
     """
-    نکته: چون ویدیوها حداکثر یک دقیقه‌ان و فرکانس اجرا حدود یک بار در ساعت،
-    این endpoint به‌صورت synchronous (بدون صف جدا) کل کار رو انجام می‌ده،
-    ولی پردازش سنگین توی یه ترد جدا (asyncio.to_thread) اجرا میشه تا
-    سرویس در طول پردازش، همچنان به health-check ها جواب بده.
+    این endpoint فوراً جواب می‌ده (بدون معطلی) و یه job_id برمی‌گردونه.
+    پردازش واقعی توی پس‌زمینه ادامه پیدا می‌کنه؛ برای دیدن نتیجه، هرچند ثانیه
+    یه‌بار GET /dub/status/{job_id} رو صدا بزن.
+
+    نکته: نگه‌داشتن یه اتصال HTTP باز برای چند دقیقه (تا کل پردازش تموم بشه)
+    باعث می‌شد Render خودش اتصال رو قطع کنه (به‌خاطر محدودیت timeout پروکسی).
+    با این الگو، دیگه هیچ اتصالی طولانی باز نمی‌مونه.
     """
     if not MISTRAL_API_KEY:
         raise HTTPException(500, "MISTRAL_API_KEY تنظیم نشده روی سرویس")
 
-    job_dir = WORK_DIR / str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        return await asyncio.to_thread(_run_dubbing_pipeline, req, job_dir)
-    except Exception as e:
-        logger.exception(f"[{req.content_id}] خطا در فرآیند دوبله")
-        raise HTTPException(500, f"خطا در فرآیند دوبله: {e}")
+    JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="processing")
+
+    # اجرا در پس‌زمینه، بدون منتظر موندن endpoint برای تموم شدنش
+    asyncio.create_task(asyncio.to_thread(_run_dubbing_job, job_id, req, job_dir))
+
+    return JobAccepted(job_id=job_id, content_id=req.content_id)
+
+
+@router.get("/status/{job_id}", response_model=JobStatus)
+async def get_dubbing_status(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job_id پیدا نشد")
+    return job
     # توجه: job_dir رو عمداً پاک نکردیم چون آپلود به بک‌بلیز در مرحله‌ی بعدی (n8n)
     # از local_output_path استفاده می‌کنه. باید بعد از آپلود موفق، یه endpoint یا
-    # cronjob جداگانه برای پاک‌سازی /tmp/dubbing اضافه بشه.
+    # cronjob جداگانه برای پاک‌سازی /tmp/dubbing و JOBS اضافه بشه.
