@@ -314,3 +314,6 @@ def get_presigned_url(
         raise HTTPException(status_code=502, detail=f"Could not generate presigned URL: {e}")
 
     return {"url": url, "expires_in": expires_in}
+
+from dubbing import router as dubbing_router
+app.include_router(dubbing_router, prefix="/dub")
