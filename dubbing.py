@@ -45,6 +45,19 @@ class DubResult(BaseModel):
 
 # ---------- توابع کمکی هر مرحله ----------
 
+def has_video_stream(video_path: Path) -> bool:
+    """چک می‌کنه فایل دانلودشده واقعاً استریم تصویری داره (یعنی یه ویدیوی معتبره، نه HTML/خطا)"""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return bool(result.stdout.strip())
+
+
 def has_audio_stream(video_path: Path) -> bool:
     """چک می‌کنه ویدیو اصلاً استریم صوتی داره یا نه (با ffprobe)"""
     cmd = [
@@ -176,12 +189,20 @@ async def process_dubbing(req: DubRequest):
 
         # ۱. دانلود ویدیو از لینک presign شده
         import httpx
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             resp = await client.get(req.video_url, timeout=60)
             resp.raise_for_status()
             video_path.write_bytes(resp.content)
 
-        # ۲. چک اینکه اصلا صدا داره یا نه؛ اگه نداشت، دوبله بی‌معنیه، skip کن
+        # ۲. اعتبارسنجی اینکه چیزی که دانلود شده واقعاً یه فایل ویدیوییه
+        if not has_video_stream(video_path):
+            return DubResult(
+                content_id=req.content_id,
+                skipped=True,
+                skip_reason="فایل دانلودشده یک ویدیوی معتبر نیست (احتمالا لینک مستقیم فایل نبوده)",
+            )
+
+        # ۳. چک اینکه اصلا صدا داره یا نه؛ اگه نداشت، دوبله بی‌معنیه، skip کن
         if not has_audio_stream(video_path):
             return DubResult(
                 content_id=req.content_id,
