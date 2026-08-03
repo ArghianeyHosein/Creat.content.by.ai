@@ -164,18 +164,26 @@ def transcribe(audio_path: Path) -> tuple[str, str]:
 
 
 def translate_to_persian(text: str) -> str:
-    """ترجمه متن به فارسی با Mistral"""
-    from mistralai import Mistral
+    """ترجمه متن به فارسی با فراخوانی مستقیم REST API میسترال (بدون نیاز به SDK رسمی)"""
+    import httpx
 
-    client = Mistral(api_key=MISTRAL_API_KEY)
-    resp = client.chat.complete(
-        model="mistral-small-latest",
-        messages=[{
-            "role": "user",
-            "content": f"این متن رو فقط ترجمه کن به فارسی روان، بدون هیچ توضیح اضافه:\n\n{text}",
-        }],
+    resp = httpx.post(
+        "https://api.mistral.ai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {MISTRAL_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "mistral-small-latest",
+            "messages": [{
+                "role": "user",
+                "content": f"این متن رو فقط ترجمه کن به فارسی روان، بدون هیچ توضیح اضافه:\n\n{text}",
+            }],
+        },
+        timeout=30,
     )
-    return resp.choices[0].message.content.strip()
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 async def synthesize_speech(text: str, gender: str, output_path: Path) -> None:
