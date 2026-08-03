@@ -177,7 +177,7 @@ def transcribe_segments(audio_path: Path) -> tuple[list[dict], str]:
     """
     from faster_whisper import WhisperModel
 
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    model = WhisperModel("base", device="cpu", compute_type="int8")
     segments_iter, info = model.transcribe(str(audio_path), beam_size=1, vad_filter=True)
 
     segments = []
