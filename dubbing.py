@@ -159,7 +159,7 @@ def transcribe(audio_path: Path) -> tuple[str, str]:
     from faster_whisper import WhisperModel
 
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    segments, info = model.transcribe(str(audio_path), beam_size=1)
+    segments, info = model.transcribe(str(audio_path), beam_size=1, vad_filter=True)
     full_text = " ".join(seg.text.strip() for seg in segments)
     return full_text, info.language
 
@@ -197,12 +197,12 @@ async def synthesize_speech(text: str, gender: str, output_path: Path) -> None:
 
 
 def merge_audio_with_video(video_path: Path, audio_path: Path, output_path: Path) -> None:
-    """جایگزینی صدای اصلی ویدیو با صدای دوبله‌شده"""
+    """جایگزینی صدای اصلی ویدیو با صدای دوبله‌شده (بدون بریدن طول ویدیو به اندازه‌ی صدای کوتاه‌تر)"""
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
         "-map", "0:v", "-map", "1:a",
         "-c:v", "copy", "-c:a", "aac",
-        "-shortest", str(output_path),
+        str(output_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
