@@ -41,6 +41,7 @@ class DubResult(BaseModel):
     local_output_path: str | None = None   # مسیر فایل نهایی روی دیسک سرویس؛ آپلود به بک‌بلیز جدا انجام میشه
     skipped: bool = False
     skip_reason: str | None = None
+    skip_reason_en: str | None = None   # نسخه انگلیسی، برای دیدن راحت توی ترمینال‌هایی که فونت فارسی ندارن
 
 
 # ---------- توابع کمکی هر مرحله ----------
@@ -200,6 +201,7 @@ async def process_dubbing(req: DubRequest):
                 content_id=req.content_id,
                 skipped=True,
                 skip_reason="فایل دانلودشده یک ویدیوی معتبر نیست (احتمالا لینک مستقیم فایل نبوده)",
+                skip_reason_en="downloaded file has no valid video stream (link may not be a direct file link)",
             )
 
         # ۳. چک اینکه اصلا صدا داره یا نه؛ اگه نداشت، دوبله بی‌معنیه، skip کن
@@ -208,6 +210,7 @@ async def process_dubbing(req: DubRequest):
                 content_id=req.content_id,
                 skipped=True,
                 skip_reason="ویدیو استریم صوتی ندارد",
+                skip_reason_en="video has no audio stream",
             )
 
         # ۳. جدا کردن صدا
