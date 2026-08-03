@@ -89,18 +89,45 @@ def extract_audio(video_path: Path, audio_path: Path) -> None:
 
 def detect_dominant_gender(audio_path: Path) -> str:
     """
-    نسخه‌ی سبک (بدون pyannote/torch) برای پلن رایگان Render با ۵۱۲ مگابایت RAM.
-    به‌جای تفکیک گوینده‌ها، یک جنسیت غالب برای کل فایل صوتی تشخیص می‌ده
-    (میانه‌ی pitch روی کل صدا). محدودیت: نمی‌تونه چند گوینده با جنسیت متفاوت
-    رو توی یک ویدیو جدا کنه — برای اون قابلیت به فایل dubbing_prompt.md مراجعه کن.
+    نسخه‌ی فوق‌سبک (بدون librosa/numba/pyannote/torch) برای پلن رایگان Render.
+    به‌جای librosa.yin (که به‌خاطر کامپایلر numba حافظه‌ی زیادی حین import مصرف می‌کنه)،
+    اینجا با خود numpy یه تشخیص pitch ساده با autocorrelation انجام می‌دیم.
+    محدودیت: یک جنسیت غالب برای کل فایل، نه به‌ازای هر گوینده — برای چند-گوینده
+    به فایل dubbing_prompt.md مراجعه کن.
     """
+    import wave
     import numpy as np
-    import librosa
 
-    y, sr = librosa.load(str(audio_path), sr=16000)
-    f0 = librosa.yin(y, fmin=65, fmax=400, sr=sr)
-    f0 = f0[f0 > 0]
-    pitch = float(np.median(f0)) if len(f0) else 165.0
+    with wave.open(str(audio_path), "rb") as wf:
+        sr = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+    y = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    frame_len = int(sr * 0.04)   # پنجره‌ی ۴۰ میلی‌ثانیه‌ای
+    hop = frame_len // 2
+    min_lag = int(sr / 400)      # سقف فرکانس ۴۰۰ هرتز
+    max_lag = int(sr / 65)       # کف فرکانس ۶۵ هرتز
+
+    pitches = []
+    for start in range(0, max(0, len(y) - frame_len), hop):
+        frame = y[start:start + frame_len]
+        frame = frame - frame.mean()
+        if np.max(np.abs(frame)) < 0.01:   # سکوت، رد شو
+            continue
+        corr = np.correlate(frame, frame, mode="full")
+        corr = corr[len(corr) // 2:]
+        if max_lag >= len(corr):
+            continue
+        segment = corr[min_lag:max_lag]
+        if len(segment) == 0:
+            continue
+        peak_lag = int(np.argmax(segment)) + min_lag
+        if corr[peak_lag] <= 0:
+            continue
+        pitches.append(sr / peak_lag)
+
+    pitch = float(np.median(pitches)) if pitches else 165.0
     return "male" if pitch < 165 else "female"
 
 
@@ -108,8 +135,8 @@ def transcribe(audio_path: Path) -> tuple[str, str]:
     """تبدیل صدا به متن با faster-whisper. خروجی: (متن کامل, زبان تشخیص داده‌شده)"""
     from faster_whisper import WhisperModel
 
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    segments, info = model.transcribe(str(audio_path))
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    segments, info = model.transcribe(str(audio_path), beam_size=1)
     full_text = " ".join(seg.text.strip() for seg in segments)
     return full_text, info.language
 
