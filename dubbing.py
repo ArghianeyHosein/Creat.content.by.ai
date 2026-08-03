@@ -154,14 +154,38 @@ def detect_dominant_gender(audio_path: Path) -> str:
     return "male" if pitch < 165 else "female"
 
 
-def transcribe(audio_path: Path) -> tuple[str, str]:
-    """تبدیل صدا به متن با faster-whisper. خروجی: (متن کامل, زبان تشخیص داده‌شده)"""
+def ffprobe_duration(path: Path) -> float:
+    """طول (ثانیه) یه فایل صوتی/ویدیویی رو با ffprobe برمی‌گردونه"""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        raise RuntimeError(f"ffprobe duration failed: {result.stderr}")
+
+
+def transcribe_segments(audio_path: Path) -> tuple[list[dict], str]:
+    """
+    تبدیل صدا به متن **به‌تفکیک جمله**، با timestamp دقیق هر جمله.
+    خروجی: (لیست {"start","end","text"}, زبان تشخیص داده‌شده)
+    این جایگزین نسخه‌ی قبلی شد که کل صدا رو یک‌جا (بدون هماهنگی زمانی) ترجمه می‌کرد.
+    """
     from faster_whisper import WhisperModel
 
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    segments, info = model.transcribe(str(audio_path), beam_size=1, vad_filter=True)
-    full_text = " ".join(seg.text.strip() for seg in segments)
-    return full_text, info.language
+    segments_iter, info = model.transcribe(str(audio_path), beam_size=1, vad_filter=True)
+
+    segments = []
+    for seg in segments_iter:
+        text = seg.text.strip()
+        if text:
+            segments.append({"start": seg.start, "end": seg.end, "text": text})
+    return segments, info.language
 
 
 def translate_to_persian(text: str) -> str:
@@ -196,8 +220,75 @@ async def synthesize_speech(text: str, gender: str, output_path: Path) -> None:
     await asyncio.wait_for(communicate.save(str(output_path)), timeout=45)
 
 
+def fit_segment_to_window(raw_audio_path: Path, target_duration: float, out_path: Path) -> None:
+    """
+    اگه صدای TTS تولیدشده از بازه‌ی زمانی جمله‌ی اصلی بلندتر بود، کمی سریع‌ترش می‌کنیم
+    (حداکثر ۲ برابر، محدودیت خودِ فیلتر atempo) تا داخل زمان جمله جا بشه و با جمله‌ی
+    بعدی قاطی نشه. همچنین به مونو/۲۴کیلوهرتز نرمالایز می‌شه تا mix بعدی یکدست باشه.
+    """
+    actual = ffprobe_duration(raw_audio_path)
+    if target_duration > 0.05 and actual > target_duration * 1.1:
+        factor = min(actual / target_duration, 2.0)
+        cmd = [
+            "ffmpeg", "-y", "-i", str(raw_audio_path),
+            "-filter:a", f"atempo={factor:.3f}",
+            "-ac", "1", "-ar", "24000",
+            str(out_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-i", str(raw_audio_path),
+            "-ac", "1", "-ar", "24000",
+            str(out_path),
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg fit segment failed: {result.stderr}")
+
+
+def build_timed_audio_track(dubbed_segments: list[dict], total_duration: float, output_path: Path) -> None:
+    """
+    یه ترک صوتی به طول کامل ویدیو می‌سازه و هر قطعه‌ی دوبله‌شده رو دقیقاً سر
+    زمان شروع جمله‌ی اصلیش (نه پشت سر هم از اول) قرار می‌ده.
+    dubbed_segments: هر عنصر {"start": float, "path": Path} (فایل صوتی نرمال‌شده)
+    """
+    n = len(dubbed_segments)
+    if n == 0:
+        cmd = [
+            "ffmpeg", "-y", "-f", "lavfi", "-t", f"{total_duration}",
+            "-i", "anullsrc=r=24000:cl=mono", "-ac", "1", str(output_path),
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+        return
+
+    inputs = []
+    delay_filters = []
+    for i, seg in enumerate(dubbed_segments):
+        inputs += ["-i", str(seg["path"])]
+        delay_ms = max(0, int(seg["start"] * 1000))
+        delay_filters.append(f"[{i}:a]adelay={delay_ms}|{delay_ms}[a{i}]")
+
+    mix_labels = "".join(f"[a{i}]" for i in range(n)) + f"[{n}:a]"
+    filter_complex = (
+        ";".join(delay_filters)
+        + f";{mix_labels}amix=inputs={n + 1}:duration=longest:dropout_transition=0,volume={n + 1}[aout]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-f", "lavfi", "-t", f"{total_duration}", "-i", "anullsrc=r=24000:cl=mono",
+        "-filter_complex", filter_complex,
+        "-map", "[aout]",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg build timed track failed: {result.stderr}")
+
+
 def merge_audio_with_video(video_path: Path, audio_path: Path, output_path: Path) -> None:
-    """جایگزینی صدای اصلی ویدیو با صدای دوبله‌شده (بدون بریدن طول ویدیو به اندازه‌ی صدای کوتاه‌تر)"""
+    """جایگزینی صدای اصلی ویدیو با صدای دوبله‌شده (هر دو از قبل هم‌طول ویدیو ساخته شدن)"""
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
         "-map", "0:v", "-map", "1:a",
@@ -221,7 +312,7 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
 
     video_path = job_dir / "input.mp4"
     audio_path = job_dir / "audio.wav"
-    dubbed_audio_path = job_dir / "dubbed.mp3"
+    dubbed_track_path = job_dir / "dubbed_track.wav"
     output_path = job_dir / "output.mp4"
 
     logger.info(f"[{req.content_id}] مرحله ۱: دانلود ویدیو")
@@ -256,24 +347,39 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
     gender = detect_dominant_gender(audio_path)
     logger.info(f"[{req.content_id}] جنسیت تشخیص داده شده: {gender}")
 
-    logger.info(f"[{req.content_id}] مرحله ۶: تبدیل صدا به متن (whisper tiny)")
-    original_text, detected_lang = transcribe(audio_path)
+    logger.info(f"[{req.content_id}] مرحله ۶: تبدیل صدا به متن به‌تفکیک جمله (whisper tiny)")
+    raw_segments, detected_lang = transcribe_segments(audio_path)
     original_language = req.original_language or detected_lang
-    logger.info(f"[{req.content_id}] زبان: {original_language}, طول متن: {len(original_text)} کاراکتر")
+    logger.info(f"[{req.content_id}] زبان: {original_language}, تعداد جمله: {len(raw_segments)}")
 
-    logger.info(f"[{req.content_id}] مرحله ۷: ترجمه با Mistral")
-    persian_text = translate_to_persian(original_text)
+    total_duration = ffprobe_duration(video_path)
+    dubbed_segments = []
+    persian_full_text_parts = []
 
-    logger.info(f"[{req.content_id}] مرحله ۸: تولید صدای دوبله (edge-tts)")
-    asyncio.run(synthesize_speech(persian_text, gender, dubbed_audio_path))
+    for i, seg in enumerate(raw_segments):
+        logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: ترجمه")
+        persian_text = translate_to_persian(seg["text"])
+        persian_full_text_parts.append(persian_text)
 
-    logger.info(f"[{req.content_id}] مرحله ۹: ترکیب نهایی")
-    merge_audio_with_video(video_path, dubbed_audio_path, output_path)
+        raw_tts_path = job_dir / f"seg_{i}_raw.mp3"
+        fitted_path = job_dir / f"seg_{i}.wav"
+        logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: TTS")
+        asyncio.run(synthesize_speech(persian_text, gender, raw_tts_path))
+
+        window = max(0.3, seg["end"] - seg["start"])
+        fit_segment_to_window(raw_tts_path, window, fitted_path)
+        dubbed_segments.append({"start": seg["start"], "path": fitted_path})
+
+    logger.info(f"[{req.content_id}] مرحله ۷: چیدن قطعات صوتی سر زمان درستشون")
+    build_timed_audio_track(dubbed_segments, total_duration, dubbed_track_path)
+
+    logger.info(f"[{req.content_id}] مرحله ۸: ترکیب نهایی با ویدیو")
+    merge_audio_with_video(video_path, dubbed_track_path, output_path)
 
     logger.info(f"[{req.content_id}] تمام شد ✅")
     return DubResult(
         content_id=req.content_id,
-        dubbed_transcript=persian_text,
+        dubbed_transcript=" ".join(persian_full_text_parts),
         original_language=original_language,
         local_output_path=str(output_path),
     )
