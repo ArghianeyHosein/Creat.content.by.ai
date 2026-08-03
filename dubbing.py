@@ -94,7 +94,7 @@ def diarize_and_detect_gender(audio_path: Path) -> list[dict]:
     import librosa
 
     pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", use_auth_token=HF_TOKEN
+        "pyannote/speaker-diarization-3.1", token=HF_TOKEN
     )
     diarization = pipeline(str(audio_path))
 
