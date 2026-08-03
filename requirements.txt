@@ -2,3 +2,10 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 yt-dlp==2026.07.04
 boto3
+faster-whisper
+pyannote.audio
+edge-tts
+mistralai
+httpx
+librosa
+numpy
