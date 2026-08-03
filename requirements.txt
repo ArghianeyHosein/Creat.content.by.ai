@@ -12,3 +12,11 @@ mistralai
 httpx
 librosa
 numpy
+# این خط‌ها رو به requirements.txt سرویس فعلی اضافه کن (نه جایگزین کل فایل)
+# نکته: pyannote.audio و torch دیگه لازم نیستن (به‌خاطر محدودیت حافظه‌ی پلن رایگان حذف شدن)
+faster-whisper
+edge-tts
+mistralai
+httpx
+librosa
+numpy
