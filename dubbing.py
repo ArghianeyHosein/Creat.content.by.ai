@@ -17,12 +17,16 @@ Environment Variables مورد نیاز (باید روی Render ست بشن):
 import os
 import uuid
 import shutil
+import logging
+import asyncio
 import subprocess
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter()
+logger = logging.getLogger("dubbing")
+logging.basicConfig(level=logging.INFO)
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
@@ -157,12 +161,12 @@ def translate_to_persian(text: str) -> str:
 
 
 async def synthesize_speech(text: str, gender: str, output_path: Path) -> None:
-    """تولید صدا با edge-tts بر اساس جنسیت گوینده"""
+    """تولید صدا با edge-tts بر اساس جنسیت گوینده (با timeout تا در صورت مسدود بودن شبکه، بی‌نهایت هنگ نکنه)"""
     import edge_tts
 
     voice = "fa-IR-DilaraNeural" if gender == "female" else "fa-IR-FaridNeural"
     communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(str(output_path))
+    await asyncio.wait_for(communicate.save(str(output_path)), timeout=45)
 
 
 def merge_audio_with_video(video_path: Path, audio_path: Path, output_path: Path) -> None:
@@ -180,11 +184,81 @@ def merge_audio_with_video(video_path: Path, audio_path: Path, output_path: Path
 
 # ---------- endpoint اصلی ----------
 
+def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
+    """
+    کل پایپ‌لاین سنگین (I/O + CPU-bound) اینجا به‌صورت synchronous اجرا میشه
+    و از endpoint با asyncio.to_thread صدا زده میشه، تا event loop اصلی
+    (و health-check های Render) در طول پردازش بلاک نشن.
+    """
+    import httpx
+
+    video_path = job_dir / "input.mp4"
+    audio_path = job_dir / "audio.wav"
+    dubbed_audio_path = job_dir / "dubbed.mp3"
+    output_path = job_dir / "output.mp4"
+
+    logger.info(f"[{req.content_id}] مرحله ۱: دانلود ویدیو")
+    with httpx.Client(follow_redirects=True) as client:
+        resp = client.get(req.video_url, timeout=60)
+        resp.raise_for_status()
+        video_path.write_bytes(resp.content)
+    logger.info(f"[{req.content_id}] دانلود تموم شد، حجم: {video_path.stat().st_size} بایت")
+
+    logger.info(f"[{req.content_id}] مرحله ۲: اعتبارسنجی استریم ویدیو")
+    if not has_video_stream(video_path):
+        return DubResult(
+            content_id=req.content_id,
+            skipped=True,
+            skip_reason="فایل دانلودشده یک ویدیوی معتبر نیست (احتمالا لینک مستقیم فایل نبوده)",
+            skip_reason_en="downloaded file has no valid video stream (link may not be a direct file link)",
+        )
+
+    logger.info(f"[{req.content_id}] مرحله ۳: چک وجود صدا")
+    if not has_audio_stream(video_path):
+        return DubResult(
+            content_id=req.content_id,
+            skipped=True,
+            skip_reason="ویدیو استریم صوتی ندارد",
+            skip_reason_en="video has no audio stream",
+        )
+
+    logger.info(f"[{req.content_id}] مرحله ۴: جدا کردن صدا با ffmpeg")
+    extract_audio(video_path, audio_path)
+
+    logger.info(f"[{req.content_id}] مرحله ۵: تشخیص جنسیت غالب")
+    gender = detect_dominant_gender(audio_path)
+    logger.info(f"[{req.content_id}] جنسیت تشخیص داده شده: {gender}")
+
+    logger.info(f"[{req.content_id}] مرحله ۶: تبدیل صدا به متن (whisper tiny)")
+    original_text, detected_lang = transcribe(audio_path)
+    original_language = req.original_language or detected_lang
+    logger.info(f"[{req.content_id}] زبان: {original_language}, طول متن: {len(original_text)} کاراکتر")
+
+    logger.info(f"[{req.content_id}] مرحله ۷: ترجمه با Mistral")
+    persian_text = translate_to_persian(original_text)
+
+    logger.info(f"[{req.content_id}] مرحله ۸: تولید صدای دوبله (edge-tts)")
+    asyncio.run(synthesize_speech(persian_text, gender, dubbed_audio_path))
+
+    logger.info(f"[{req.content_id}] مرحله ۹: ترکیب نهایی")
+    merge_audio_with_video(video_path, dubbed_audio_path, output_path)
+
+    logger.info(f"[{req.content_id}] تمام شد ✅")
+    return DubResult(
+        content_id=req.content_id,
+        dubbed_transcript=persian_text,
+        original_language=original_language,
+        local_output_path=str(output_path),
+    )
+
+
 @router.post("/process", response_model=DubResult)
 async def process_dubbing(req: DubRequest):
     """
     نکته: چون ویدیوها حداکثر یک دقیقه‌ان و فرکانس اجرا حدود یک بار در ساعت،
-    این endpoint به‌صورت synchronous (بدون صف جدا) کل کار رو انجام می‌ده.
+    این endpoint به‌صورت synchronous (بدون صف جدا) کل کار رو انجام می‌ده،
+    ولی پردازش سنگین توی یه ترد جدا (asyncio.to_thread) اجرا میشه تا
+    سرویس در طول پردازش، همچنان به health-check ها جواب بده.
     """
     if not MISTRAL_API_KEY:
         raise HTTPException(500, "MISTRAL_API_KEY تنظیم نشده روی سرویس")
@@ -193,63 +267,9 @@ async def process_dubbing(req: DubRequest):
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        video_path = job_dir / "input.mp4"
-        audio_path = job_dir / "audio.wav"
-        dubbed_audio_path = job_dir / "dubbed.mp3"
-        output_path = job_dir / "output.mp4"
-
-        # ۱. دانلود ویدیو از لینک presign شده
-        import httpx
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.get(req.video_url, timeout=60)
-            resp.raise_for_status()
-            video_path.write_bytes(resp.content)
-
-        # ۲. اعتبارسنجی اینکه چیزی که دانلود شده واقعاً یه فایل ویدیوییه
-        if not has_video_stream(video_path):
-            return DubResult(
-                content_id=req.content_id,
-                skipped=True,
-                skip_reason="فایل دانلودشده یک ویدیوی معتبر نیست (احتمالا لینک مستقیم فایل نبوده)",
-                skip_reason_en="downloaded file has no valid video stream (link may not be a direct file link)",
-            )
-
-        # ۳. چک اینکه اصلا صدا داره یا نه؛ اگه نداشت، دوبله بی‌معنیه، skip کن
-        if not has_audio_stream(video_path):
-            return DubResult(
-                content_id=req.content_id,
-                skipped=True,
-                skip_reason="ویدیو استریم صوتی ندارد",
-                skip_reason_en="video has no audio stream",
-            )
-
-        # ۳. جدا کردن صدا
-        extract_audio(video_path, audio_path)
-
-        # ۴. تشخیص جنسیت غالب صدا (نسخه‌ی سبک بدون pyannote - رجوع کن به dubbing_prompt.md)
-        gender = detect_dominant_gender(audio_path)
-
-        # ۵. تبدیل صدا به متن
-        original_text, detected_lang = transcribe(audio_path)
-        original_language = req.original_language or detected_lang
-
-        # ۶. ترجمه به فارسی
-        persian_text = translate_to_persian(original_text)
-
-        # ۷. تولید صدای دوبله
-        await synthesize_speech(persian_text, gender, dubbed_audio_path)
-
-        # ۸. ترکیب نهایی
-        merge_audio_with_video(video_path, dubbed_audio_path, output_path)
-
-        return DubResult(
-            content_id=req.content_id,
-            dubbed_transcript=persian_text,
-            original_language=original_language,
-            local_output_path=str(output_path),
-        )
-
+        return await asyncio.to_thread(_run_dubbing_pipeline, req, job_dir)
     except Exception as e:
+        logger.exception(f"[{req.content_id}] خطا در فرآیند دوبله")
         raise HTTPException(500, f"خطا در فرآیند دوبله: {e}")
     # توجه: job_dir رو عمداً پاک نکردیم چون آپلود به بک‌بلیز در مرحله‌ی بعدی (n8n)
     # از local_output_path استفاده می‌کنه. باید بعد از آپلود موفق، یه endpoint یا
