@@ -36,12 +36,27 @@ class DubRequest(BaseModel):
 
 class DubResult(BaseModel):
     content_id: str
-    dubbed_transcript: str
-    original_language: str
-    local_output_path: str   # مسیر فایل نهایی روی دیسک سرویس؛ آپلود به بک‌بلیز جدا انجام میشه
+    dubbed_transcript: str | None = None
+    original_language: str | None = None
+    local_output_path: str | None = None   # مسیر فایل نهایی روی دیسک سرویس؛ آپلود به بک‌بلیز جدا انجام میشه
+    skipped: bool = False
+    skip_reason: str | None = None
 
 
 # ---------- توابع کمکی هر مرحله ----------
+
+def has_audio_stream(video_path: Path) -> bool:
+    """چک می‌کنه ویدیو اصلاً استریم صوتی داره یا نه (با ffprobe)"""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return bool(result.stdout.strip())
+
 
 def extract_audio(video_path: Path, audio_path: Path) -> None:
     """جدا کردن صدا از ویدیو با ffmpeg"""
@@ -166,10 +181,18 @@ async def process_dubbing(req: DubRequest):
             resp.raise_for_status()
             video_path.write_bytes(resp.content)
 
-        # ۲. جدا کردن صدا
+        # ۲. چک اینکه اصلا صدا داره یا نه؛ اگه نداشت، دوبله بی‌معنیه، skip کن
+        if not has_audio_stream(video_path):
+            return DubResult(
+                content_id=req.content_id,
+                skipped=True,
+                skip_reason="ویدیو استریم صوتی ندارد",
+            )
+
+        # ۳. جدا کردن صدا
         extract_audio(video_path, audio_path)
 
-        # ۳. تشخیص گوینده‌ها و جنسیت (فعلاً برای انتخاب صدای TTS غالب استفاده می‌شه)
+        # ۴. تشخیص گوینده‌ها و جنسیت (فعلاً برای انتخاب صدای TTS غالب استفاده می‌شه)
         segments = diarize_and_detect_gender(audio_path)
         # اگه چند گوینده داشتیم، جنسیت غالب (بر اساس مجموع مدت زمان) رو انتخاب می‌کنیم
         gender = "male"
@@ -180,17 +203,17 @@ async def process_dubbing(req: DubRequest):
                 durations[s["gender"]] += s["end"] - s["start"]
             gender = max(durations, key=durations.get)
 
-        # ۴. تبدیل صدا به متن
+        # ۵. تبدیل صدا به متن
         original_text, detected_lang = transcribe(audio_path)
         original_language = req.original_language or detected_lang
 
-        # ۵. ترجمه به فارسی
+        # ۶. ترجمه به فارسی
         persian_text = translate_to_persian(original_text)
 
-        # ۶. تولید صدای دوبله
+        # ۷. تولید صدای دوبله
         await synthesize_speech(persian_text, gender, dubbed_audio_path)
 
-        # ۷. ترکیب نهایی
+        # ۸. ترکیب نهایی
         merge_audio_with_video(video_path, dubbed_audio_path, output_path)
 
         return DubResult(
