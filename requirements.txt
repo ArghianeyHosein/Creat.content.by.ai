@@ -7,3 +7,4 @@ edge-tts
 mistralai
 httpx
 numpy
+google-genai
