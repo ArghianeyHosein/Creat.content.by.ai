@@ -31,8 +31,14 @@ logging.basicConfig(level=logging.INFO)
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # اختیاری - اگه ست بشه، به‌جای whisper+Mistral استفاده میشه (تست)
 WORK_DIR = Path("/tmp/dubbing")
 WORK_DIR.mkdir(exist_ok=True)
+
+# سقف‌های ایمنی برای جلوگیری از OOM روی پلن رایگان Render (۵۱۲ مگابایت RAM).
+# این عددها رو می‌تونی با env var عوض کنی، بدون نیاز به تغییر کد.
+MAX_FILE_SIZE_MB = float(os.environ.get("DUB_MAX_FILE_SIZE_MB", "30"))
+MAX_DURATION_SECONDS = float(os.environ.get("DUB_MAX_DURATION_SECONDS", "180"))  # ۳ دقیقه
 
 # وضعیت job ها توی حافظه نگه‌داری میشه (چون فرکانس اجرا کمه - حدود ۱ در ساعت -
 # نیازی به دیتابیس جدا برای این نیست؛ سرویس تا وقتی جواب نهایی رو نگرفتی نمی‌خوابه)
@@ -168,6 +174,120 @@ def ffprobe_duration(path: Path) -> float:
         return float(result.stdout.strip())
     except ValueError:
         raise RuntimeError(f"ffprobe duration failed: {result.stderr}")
+
+
+def download_and_validate_video(req: "DubRequest", video_path: Path) -> tuple["DubResult | None", float]:
+    """
+    دانلود (streaming، با سقف حجم) + اعتبارسنجی ویدیو + چک صدا + سقف طول زمانی.
+    مشترک بین پایپ‌لاین whisper و پایپ‌لاین Gemini.
+    خروجی: (DubResult در صورت skip شدن یا None اگه همه‌چی اوکی بود, طول ویدیو به ثانیه)
+    """
+    import httpx
+
+    logger.info(f"[{req.content_id}] دانلود ویدیو (سقف حجم: {MAX_FILE_SIZE_MB}MB)")
+    max_bytes = int(MAX_FILE_SIZE_MB * 1024 * 1024)
+    with httpx.Client(follow_redirects=True) as client:
+        with client.stream("GET", req.video_url, timeout=60) as resp:
+            resp.raise_for_status()
+            content_length = resp.headers.get("content-length")
+            if content_length and int(content_length) > max_bytes:
+                return DubResult(
+                    content_id=req.content_id, skipped=True,
+                    skip_reason=f"حجم فایل بیشتر از سقف مجاز ({MAX_FILE_SIZE_MB} مگابایت) است",
+                    skip_reason_en=f"file size exceeds the {MAX_FILE_SIZE_MB}MB limit",
+                ), 0.0
+            total = 0
+            with open(video_path, "wb") as f:
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        return DubResult(
+                            content_id=req.content_id, skipped=True,
+                            skip_reason=f"حجم فایل بیشتر از سقف مجاز ({MAX_FILE_SIZE_MB} مگابایت) است",
+                            skip_reason_en=f"file size exceeds the {MAX_FILE_SIZE_MB}MB limit",
+                        ), 0.0
+                    f.write(chunk)
+    logger.info(f"[{req.content_id}] دانلود تموم شد، حجم: {video_path.stat().st_size} بایت")
+
+    if not has_video_stream(video_path):
+        return DubResult(
+            content_id=req.content_id, skipped=True,
+            skip_reason="فایل دانلودشده یک ویدیوی معتبر نیست (احتمالا لینک مستقیم فایل نبوده)",
+            skip_reason_en="downloaded file has no valid video stream (link may not be a direct file link)",
+        ), 0.0
+
+    total_duration = ffprobe_duration(video_path)
+    if total_duration > MAX_DURATION_SECONDS:
+        return DubResult(
+            content_id=req.content_id, skipped=True,
+            skip_reason=f"طول ویدیو ({total_duration:.0f} ثانیه) بیشتر از سقف مجاز ({MAX_DURATION_SECONDS:.0f} ثانیه) است",
+            skip_reason_en=f"video duration ({total_duration:.0f}s) exceeds the {MAX_DURATION_SECONDS:.0f}s limit",
+        ), 0.0
+
+    if not has_audio_stream(video_path):
+        return DubResult(
+            content_id=req.content_id, skipped=True,
+            skip_reason="ویدیو استریم صوتی ندارد",
+            skip_reason_en="video has no audio stream",
+        ), 0.0
+
+    return None, total_duration
+
+
+async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path) -> None:
+    """
+    نسخه‌ی آزمایشی (Preview گوگل): صدا رو مستقیم به Gemini Live API می‌فرستیم و
+    ازش می‌خوایم بلافاصله صدای ترجمه‌شده به فارسی رو - با لحن و آهنگ مشابه گوینده‌ی
+    اصلی - برگردونه. برخلاف مسیر whisper+edge-tts، اینجا نیازی به تفکیک جمله،
+    ترجمه‌ی جدا، یا هماهنگ‌سازی دستی زمان‌بندی نیست - خودِ مدل انجامش می‌ده.
+    ورودی باید PCM خام ۱۶بیتی، ۱۶kHz، تک‌کاناله باشه (بدون هدر WAV).
+
+    هشدار: این قابلیت preview هست و ممکنه اسم مدل، پارامترها، یا فرمت پاسخ
+    بین نسخه‌های SDK فرق کنه - در صورت خطا، لاگ دقیق خطا رو چک کن.
+    """
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    model = "gemini-2.5-flash-native-audio-preview-12-2025"
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=(
+            "تو یک مترجم صوتی همزمان هستی. هرچی که می‌شنوی رو بلافاصله و با لحن، "
+            "احساس و سرعت گفتار مشابه گوینده‌ی اصلی، به زبان فارسی روان ترجمه کن و بگو."
+        ),
+    )
+
+    pcm_bytes = pcm_audio_path.read_bytes()
+    chunk_size = 4096
+    out_chunks: list[bytes] = []
+
+    async with client.aio.live.connect(model=model, config=config) as session:
+        for i in range(0, len(pcm_bytes), chunk_size):
+            chunk = pcm_bytes[i:i + chunk_size]
+            await session.send_realtime_input(
+                audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+            )
+        await session.send_realtime_input(audio_stream_end=True)
+
+        async for response in session.receive():
+            if getattr(response, "data", None):
+                out_chunks.append(response.data)
+
+    if not out_chunks:
+        raise RuntimeError("Gemini Live API هیچ صدایی برنگردوند")
+
+    raw_out_path = pcm_audio_path.with_suffix(".gemini_raw.pcm")
+    raw_out_path.write_bytes(b"".join(out_chunks))
+
+    # خروجی Live API معمولاً PCM ۲۴kHz تک‌کاناله‌ست؛ تبدیلش می‌کنیم به wav معمولی
+    cmd = [
+        "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
+        "-i", str(raw_out_path), str(output_wav_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg convert gemini output failed: {result.stderr}")
 
 
 def transcribe_segments(audio_path: Path) -> tuple[list[dict], str]:
@@ -326,44 +446,123 @@ def merge_audio_with_video(video_path: Path, audio_path: Path, output_path: Path
 
 def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
     """
+    پایپ‌لاین اصلی (whisper + Mistral + edge-tts، segment به segment).
     کل پایپ‌لاین سنگین (I/O + CPU-bound) اینجا به‌صورت synchronous اجرا میشه
     و از endpoint با asyncio.to_thread صدا زده میشه، تا event loop اصلی
     (و health-check های Render) در طول پردازش بلاک نشن.
     """
-    import httpx
-
     video_path = job_dir / "input.mp4"
     audio_path = job_dir / "audio.wav"
     dubbed_track_path = job_dir / "dubbed_track.wav"
     output_path = job_dir / "output.mp4"
 
-    logger.info(f"[{req.content_id}] مرحله ۱: دانلود ویدیو")
-    with httpx.Client(follow_redirects=True) as client:
-        resp = client.get(req.video_url, timeout=60)
-        resp.raise_for_status()
-        video_path.write_bytes(resp.content)
-    logger.info(f"[{req.content_id}] دانلود تموم شد، حجم: {video_path.stat().st_size} بایت")
-
-    logger.info(f"[{req.content_id}] مرحله ۲: اعتبارسنجی استریم ویدیو")
-    if not has_video_stream(video_path):
-        return DubResult(
-            content_id=req.content_id,
-            skipped=True,
-            skip_reason="فایل دانلودشده یک ویدیوی معتبر نیست (احتمالا لینک مستقیم فایل نبوده)",
-            skip_reason_en="downloaded file has no valid video stream (link may not be a direct file link)",
-        )
-
-    logger.info(f"[{req.content_id}] مرحله ۳: چک وجود صدا")
-    if not has_audio_stream(video_path):
-        return DubResult(
-            content_id=req.content_id,
-            skipped=True,
-            skip_reason="ویدیو استریم صوتی ندارد",
-            skip_reason_en="video has no audio stream",
-        )
+    logger.info(f"[{req.content_id}] مرحله ۱-۳: دانلود و اعتبارسنجی")
+    early_result, total_duration = download_and_validate_video(req, video_path)
+    if early_result is not None:
+        return early_result
 
     logger.info(f"[{req.content_id}] مرحله ۴: جدا کردن صدا با ffmpeg")
     extract_audio(video_path, audio_path)
+
+    logger.info(f"[{req.content_id}] مرحله ۵: تشخیص جنسیت غالب")
+    gender = detect_dominant_gender(audio_path)
+    logger.info(f"[{req.content_id}] جنسیت تشخیص داده شده: {gender}")
+
+    logger.info(f"[{req.content_id}] مرحله ۶: تبدیل صدا به متن به‌تفکیک جمله (whisper base)")
+    raw_segments, detected_lang = transcribe_segments(audio_path)
+    original_language = req.original_language or detected_lang
+    logger.info(f"[{req.content_id}] زبان: {original_language}, تعداد جمله: {len(raw_segments)}")
+
+    dubbed_segments = []
+    persian_full_text_parts = []
+    original_full_text_parts = []
+    cursor = 0.0  # پایان زمانی آخرین قطعه‌ی دوبله‌شده - برای جلوگیری از هم‌پوشانی صداها
+
+    for i, seg in enumerate(raw_segments):
+        logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: {seg['text']}")
+        original_full_text_parts.append(seg["text"])
+
+        window = max(0.3, seg["end"] - seg["start"])
+        syllable_budget = max(3, int(window * 4.5))  # تخمین تقریبی: ~۴.۵ هجا در ثانیه گفتار طبیعی
+        persian_text = translate_to_persian(seg["text"], max_syllables=syllable_budget)
+        persian_full_text_parts.append(persian_text)
+
+        raw_tts_path = job_dir / f"seg_{i}_raw.mp3"
+        fitted_path = job_dir / f"seg_{i}.wav"
+        logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: TTS")
+        asyncio.run(synthesize_speech(persian_text, gender, raw_tts_path))
+
+        fit_segment_to_window(raw_tts_path, window, fitted_path)
+
+        # اگه جمله‌ی قبلی تا بعد از شروع این جمله ادامه داشته، این یکی رو عقب می‌ندازیم
+        # تا صداها روی هم نیفتن (حتی اگه یعنی یه‌کم دیرتر از زمان اصلی whisper پخش بشه)
+        actual_start = max(seg["start"], cursor)
+        fitted_duration = ffprobe_duration(fitted_path)
+        cursor = actual_start + fitted_duration
+
+        dubbed_segments.append({"start": actual_start, "path": fitted_path})
+
+    logger.info(f"[{req.content_id}] مرحله ۷: چیدن قطعات صوتی سر زمان درستشون")
+    build_timed_audio_track(dubbed_segments, total_duration, dubbed_track_path)
+
+    logger.info(f"[{req.content_id}] مرحله ۸: ترکیب نهایی با ویدیو")
+    merge_audio_with_video(video_path, dubbed_track_path, output_path)
+
+    logger.info(f"[{req.content_id}] تمام شد ✅")
+    return DubResult(
+        content_id=req.content_id,
+        original_transcript=" ".join(original_full_text_parts),
+        dubbed_transcript=" ".join(persian_full_text_parts),
+        original_language=original_language,
+        local_output_path=str(output_path),
+    )
+
+
+def _run_gemini_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
+    """
+    پایپ‌لاین آزمایشی (Preview): بجای whisper+Mistral+edge-tts segment-by-segment،
+    صدای کامل مستقیم به Gemini Live API فرستاده میشه و صدای ترجمه‌شده (با لحن
+    مشابه) مستقیم ازش گرفته میشه - بدون نیاز به تفکیک جمله یا هماهنگ‌سازی دستی.
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY تنظیم نشده روی سرویس")
+
+    video_path = job_dir / "input.mp4"
+    pcm_audio_path = job_dir / "audio_16k.pcm"
+    dubbed_audio_path = job_dir / "gemini_dubbed.wav"
+    output_path = job_dir / "output.mp4"
+
+    logger.info(f"[{req.content_id}] (Gemini) مرحله ۱-۳: دانلود و اعتبارسنجی")
+    early_result, total_duration = download_and_validate_video(req, video_path)
+    if early_result is not None:
+        return early_result
+
+    logger.info(f"[{req.content_id}] (Gemini) مرحله ۴: استخراج PCM خام ۱۶kHz")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        str(pcm_audio_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg pcm extract failed: {result.stderr}")
+
+    logger.info(f"[{req.content_id}] (Gemini) مرحله ۵: ارسال صدا به Gemini Live API و دریافت دوبله")
+    asyncio.run(gemini_live_dub(pcm_audio_path, dubbed_audio_path))
+
+    logger.info(f"[{req.content_id}] (Gemini) مرحله ۶: ترکیب نهایی با ویدیو")
+    merge_audio_with_video(video_path, dubbed_audio_path, output_path)
+
+    logger.info(f"[{req.content_id}] (Gemini) تمام شد ✅")
+    return DubResult(
+        content_id=req.content_id,
+        original_transcript=None,  # این مسیر transcript جدا برنمی‌گردونه
+        dubbed_transcript=None,
+        original_language=None,
+        local_output_path=str(output_path),
+    )
+
+
 
     logger.info(f"[{req.content_id}] مرحله ۵: تشخیص جنسیت غالب")
     gender = detect_dominant_gender(audio_path)
@@ -374,7 +573,6 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
     original_language = req.original_language or detected_lang
     logger.info(f"[{req.content_id}] زبان: {original_language}, تعداد جمله: {len(raw_segments)}")
 
-    total_duration = ffprobe_duration(video_path)
     dubbed_segments = []
     persian_full_text_parts = []
     original_full_text_parts = []
@@ -435,6 +633,16 @@ def _run_dubbing_job(job_id: str, req: "DubRequest", job_dir: Path) -> None:
         JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="failed", error=str(e))
 
 
+def _run_gemini_dubbing_job(job_id: str, req: "DubRequest", job_dir: Path) -> None:
+    """نسخه‌ی پس‌زمینه‌ی پایپ‌لاین آزمایشی Gemini - همون الگوی _run_dubbing_job"""
+    try:
+        result = _run_gemini_dubbing_pipeline(req, job_dir)
+        JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="done", result=result)
+    except Exception as e:
+        logger.exception(f"[{req.content_id}] خطا در فرآیند دوبله (Gemini)")
+        JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="failed", error=str(e))
+
+
 @router.post("/process", response_model=JobAccepted, status_code=202)
 async def process_dubbing(req: DubRequest):
     """
@@ -457,6 +665,26 @@ async def process_dubbing(req: DubRequest):
 
     # اجرا در پس‌زمینه، بدون منتظر موندن endpoint برای تموم شدنش
     asyncio.create_task(asyncio.to_thread(_run_dubbing_job, job_id, req, job_dir))
+
+    return JobAccepted(job_id=job_id, content_id=req.content_id)
+
+
+@router.post("/process-gemini", response_model=JobAccepted, status_code=202)
+async def process_dubbing_gemini(req: DubRequest):
+    """
+    نسخه‌ی آزمایشی (Preview): مسیر Gemini Live API - صدا-به-صدا با لحن مشابه،
+    بدون تفکیک جمله یا هماهنگ‌سازی دستی. همون الگوی job نامتقارن /process رو داره.
+    نیاز به GEMINI_API_KEY روی سرویس.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY تنظیم نشده روی سرویس")
+
+    job_id = str(uuid.uuid4())
+    job_dir = WORK_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="processing")
+    asyncio.create_task(asyncio.to_thread(_run_gemini_dubbing_job, job_id, req, job_dir))
 
     return JobAccepted(job_id=job_id, content_id=req.content_id)
 
