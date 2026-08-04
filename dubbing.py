@@ -48,6 +48,7 @@ class DubRequest(BaseModel):
 
 class DubResult(BaseModel):
     content_id: str
+    original_transcript: str | None = None   # متن اصلی (قبل از ترجمه) - برای عیب‌یابی دقت whisper
     dubbed_transcript: str | None = None
     original_language: str | None = None
     local_output_path: str | None = None   # مسیر فایل نهایی روی دیسک سرویس؛ آپلود به بک‌بلیز جدا انجام میشه
@@ -355,9 +356,11 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
     total_duration = ffprobe_duration(video_path)
     dubbed_segments = []
     persian_full_text_parts = []
+    original_full_text_parts = []
 
     for i, seg in enumerate(raw_segments):
-        logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: ترجمه")
+        logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: {seg['text']}")
+        original_full_text_parts.append(seg["text"])
         persian_text = translate_to_persian(seg["text"])
         persian_full_text_parts.append(persian_text)
 
@@ -379,6 +382,7 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
     logger.info(f"[{req.content_id}] تمام شد ✅")
     return DubResult(
         content_id=req.content_id,
+        original_transcript=" ".join(original_full_text_parts),
         dubbed_transcript=" ".join(persian_full_text_parts),
         original_language=original_language,
         local_output_path=str(output_path),
