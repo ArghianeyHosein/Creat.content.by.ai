@@ -181,7 +181,10 @@ def transcribe_segments(audio_path: Path) -> tuple[list[dict], str]:
     model = WhisperModel("base", device="cpu", compute_type="int8")
     segments_iter, info = model.transcribe(
         str(audio_path), beam_size=1, vad_filter=True,
-        vad_parameters=dict(speech_pad_ms=100),  # پیش‌فرض ~۴۰۰ms بود؛ باعث میشد دوبله زودتر از موقع پخش بشه
+        vad_parameters=dict(
+            speech_pad_ms=100,           # پیش‌فرض ~۴۰۰ms بود؛ باعث میشد دوبله زودتر از موقع پخش بشه
+            min_silence_duration_ms=300,  # پیش‌فرض ~۲۰۰۰ms بود؛ مکث‌های کوتاه بین جمله‌ها رو نادیده می‌گرفت
+        ),
     )
 
     segments = []
