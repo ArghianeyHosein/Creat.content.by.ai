@@ -179,7 +179,10 @@ def transcribe_segments(audio_path: Path) -> tuple[list[dict], str]:
     from faster_whisper import WhisperModel
 
     model = WhisperModel("base", device="cpu", compute_type="int8")
-    segments_iter, info = model.transcribe(str(audio_path), beam_size=1, vad_filter=True)
+    segments_iter, info = model.transcribe(
+        str(audio_path), beam_size=1, vad_filter=True,
+        vad_parameters=dict(speech_pad_ms=100),  # پیش‌فرض ~۴۰۰ms بود؛ باعث میشد دوبله زودتر از موقع پخش بشه
+    )
 
     segments = []
     for seg in segments_iter:
@@ -359,6 +362,7 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
     dubbed_segments = []
     persian_full_text_parts = []
     original_full_text_parts = []
+    cursor = 0.0  # پایان زمانی آخرین قطعه‌ی دوبله‌شده - برای جلوگیری از هم‌پوشانی صداها
 
     for i, seg in enumerate(raw_segments):
         logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: {seg['text']}")
@@ -373,7 +377,14 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
 
         window = max(0.3, seg["end"] - seg["start"])
         fit_segment_to_window(raw_tts_path, window, fitted_path)
-        dubbed_segments.append({"start": seg["start"], "path": fitted_path})
+
+        # اگه جمله‌ی قبلی تا بعد از شروع این جمله ادامه داشته، این یکی رو عقب می‌ندازیم
+        # تا صداها روی هم نیفتن (حتی اگه یعنی یه‌کم دیرتر از زمان اصلی whisper پخش بشه)
+        actual_start = max(seg["start"], cursor)
+        fitted_duration = ffprobe_duration(fitted_path)
+        cursor = actual_start + fitted_duration
+
+        dubbed_segments.append({"start": actual_start, "path": fitted_path})
 
     logger.info(f"[{req.content_id}] مرحله ۷: چیدن قطعات صوتی سر زمان درستشون")
     build_timed_audio_track(dubbed_segments, total_duration, dubbed_track_path)
