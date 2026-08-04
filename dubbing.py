@@ -260,7 +260,19 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path, expected_
             "تو یک مترجم صوتی همزمان هستی. هرچی که می‌شنوی رو بلافاصله و با لحن، "
             "احساس و سرعت گفتار مشابه گوینده‌ی اصلی، به زبان فارسی روان ترجمه کن و بگو."
         ),
+        # تنظیم قبلی (فقط disabled=True) هیچ تأثیری نداشت - نتیجه‌ی تست عیناً
+        # همون قبلی بود. این‌بار علاوه بر خاموش کردن تشخیص خودکار، صریحاً هم
+        # می‌گیم even اگه فعالیت جدید تشخیص داده شد، جواب رو قطع نکن
+        # (activity_handling=NO_INTERRUPTION) - این فیلد جداست و شاید غایب بودنش
+        # دلیل بی‌اثر بودن اصلاح قبلی بوده.
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True),
+            activity_handling=types.ActivityHandling.NO_INTERRUPTION,
+        ),
     )
+    # لاگ می‌کنیم تا مطمئن بشیم این تنظیمات واقعاً روی آبجکت config نشستن،
+    # نه اینکه بی‌صدا نادیده گرفته شده باشن (همون چیزی که دفعه‌ی قبل رخ داد)
+    logger.info(f"[gemini_live] realtime_input_config ساخته‌شده: {config.realtime_input_config!r}")
 
     # سقف زمانی هوشمند: دو برابر طول واقعی گفتار (چون تولید صدا معمولاً کندتر از
     # پخش بلادرنگه) + یه حاشیه‌ی امن، به‌جای عدد ثابت حدسی
@@ -304,11 +316,15 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path, expected_
                 break
 
     async with client.aio.live.connect(model=model, config=config) as session:
+        # چون تشخیص خودکار مکالمه رو خاموش کردیم، باید خودمون صریح بگیم
+        # "نوبت کاربر شروع شد" و "نوبت کاربر تموم شد"
+        await session.send_realtime_input(activity_start=types.ActivityStart())
         for i in range(0, len(pcm_bytes), chunk_size):
             chunk = pcm_bytes[i:i + chunk_size]
             await session.send_realtime_input(
                 audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
             )
+        await session.send_realtime_input(activity_end=types.ActivityEnd())
         await session.send_realtime_input(audio_stream_end=True)
 
         # به‌جای حدس زدن با timeout کور، منتظر سیگنال واقعی پایان (turn_complete /
@@ -398,13 +414,28 @@ def translate_to_persian(text: str, max_syllables: int | None = None) -> str:
     return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-async def synthesize_speech(text: str, gender: str, output_path: Path) -> None:
-    """تولید صدا با edge-tts بر اساس جنسیت گوینده (با timeout تا در صورت مسدود بودن شبکه، بی‌نهایت هنگ نکنه)"""
+async def synthesize_speech(text: str, gender: str, output_path: Path, max_retries: int = 3) -> None:
+    """
+    تولید صدا با edge-tts بر اساس جنسیت گوینده.
+    - timeout تا در صورت مسدود بودن شبکه، بی‌نهایت هنگ نکنه
+    - retry با backoff چون edge-tts گاهی به‌خاطر یه محدودیت یا قطعی موقتی
+      شبکه، خطای NoAudioReceived می‌ده که با یه تلاش دوباره معمولاً حل میشه
+    """
     import edge_tts
 
     voice = "fa-IR-DilaraNeural" if gender == "female" else "fa-IR-FaridNeural"
-    communicate = edge_tts.Communicate(text, voice)
-    await asyncio.wait_for(communicate.save(str(output_path)), timeout=45)
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            await asyncio.wait_for(communicate.save(str(output_path)), timeout=45)
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(f"[edge-tts] تلاش {attempt}/{max_retries} ناموفق بود: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(1.5 * attempt)  # backoff کوتاه قبل از تلاش بعدی
+    raise last_error
 
 
 def fit_segment_to_window(raw_audio_path: Path, target_duration: float, out_path: Path) -> None:
