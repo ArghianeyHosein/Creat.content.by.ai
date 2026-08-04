@@ -234,13 +234,17 @@ def download_and_validate_video(req: "DubRequest", video_path: Path) -> tuple["D
     return None, total_duration
 
 
-async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path) -> None:
+async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path, expected_speech_duration: float = 0.0) -> None:
     """
     نسخه‌ی آزمایشی (Preview گوگل): صدا رو مستقیم به Gemini Live API می‌فرستیم و
     ازش می‌خوایم بلافاصله صدای ترجمه‌شده به فارسی رو - با لحن و آهنگ مشابه گوینده‌ی
     اصلی - برگردونه. برخلاف مسیر whisper+edge-tts، اینجا نیازی به تفکیک جمله،
     ترجمه‌ی جدا، یا هماهنگ‌سازی دستی زمان‌بندی نیست - خودِ مدل انجامش می‌ده.
     ورودی باید PCM خام ۱۶بیتی، ۱۶kHz، تک‌کاناله باشه (بدون هدر WAV).
+
+    expected_speech_duration: زمان واقعی آخرین گفتار (از whisper VAD، فقط برای
+    تخمین زمان‌بندی - نه ترجمه) - برای محاسبه‌ی یه سقف زمانی هوشمند به‌جای عدد
+    ثابت حدسی. اگه صفر بود، از یه پیش‌فرض محافظه‌کارانه استفاده می‌کنیم.
 
     هشدار: این قابلیت preview هست و ممکنه اسم مدل، پارامترها، یا فرمت پاسخ
     بین نسخه‌های SDK فرق کنه - در صورت خطا، لاگ دقیق خطا رو چک کن.
@@ -258,11 +262,46 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path) -> None:
         ),
     )
 
+    # سقف زمانی هوشمند: دو برابر طول واقعی گفتار (چون تولید صدا معمولاً کندتر از
+    # پخش بلادرنگه) + یه حاشیه‌ی امن، به‌جای عدد ثابت حدسی
+    overall_timeout = max(60.0, expected_speech_duration * 2.5 + 30.0)
+    logger.info(f"[gemini_live] سقف زمانی کلی: {overall_timeout:.0f} ثانیه (بر اساس {expected_speech_duration:.0f}s گفتار واقعی)")
+
     pcm_bytes = pcm_audio_path.read_bytes()
     chunk_size = 4096
     out_chunks: list[bytes] = []
-    silence_turns_in_a_row = 0
-    max_idle_turns = 2  # اگه ۲ بار پشت سر هم هیچ صدای جدیدی نیومد، یعنی واقعا تموم شده
+    message_count = 0
+
+    async def drain_session(session) -> None:
+        nonlocal message_count
+        turn_iter = session.receive().__aiter__()
+        while True:
+            try:
+                response = await turn_iter.__anext__()
+            except StopAsyncIteration:
+                logger.info("[gemini_live] session.receive() طبیعی تموم شد (StopAsyncIteration)")
+                break
+
+            message_count += 1
+            server_content = getattr(response, "server_content", None)
+            turn_complete = getattr(server_content, "turn_complete", None)
+            interrupted = getattr(server_content, "interrupted", None)
+            generation_complete = getattr(server_content, "generation_complete", None)
+            has_data = bool(getattr(response, "data", None))
+
+            logger.info(
+                f"[gemini_live] پیام #{message_count}: data={has_data}, "
+                f"turn_complete={turn_complete}, generation_complete={generation_complete}, "
+                f"interrupted={interrupted}"
+            )
+
+            if has_data:
+                out_chunks.append(response.data)
+
+            # اگه سیگنال صریح "تموم شدن نوبت" اومد و دیگه چیزی نمونده، خارج شو
+            if turn_complete or generation_complete:
+                logger.info("[gemini_live] سیگنال پایان دریافت شد، خروج از حلقه")
+                break
 
     async with client.aio.live.connect(model=model, config=config) as session:
         for i in range(0, len(pcm_bytes), chunk_size):
@@ -272,16 +311,15 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path) -> None:
             )
         await session.send_realtime_input(audio_stream_end=True)
 
-        # Live API مکالمه‌ای/نوبتی کار می‌کنه: بعد از هر مکث، یه "نوبت" جواب می‌ده
-        # و session.receive() برای همون یه نوبت برمی‌گرده. برای گرفتن کل فایل
-        # (نه فقط جمله‌های اول)، باید چندبار پشت سر هم منتظر نوبت‌های بعدی بمونیم.
-        while silence_turns_in_a_row < max_idle_turns:
-            got_data_this_turn = False
-            async for response in session.receive():
-                if getattr(response, "data", None):
-                    out_chunks.append(response.data)
-                    got_data_this_turn = True
-            silence_turns_in_a_row = 0 if got_data_this_turn else silence_turns_in_a_row + 1
+        # به‌جای حدس زدن با timeout کور، منتظر سیگنال واقعی پایان (turn_complete /
+        # generation_complete) می‌مونیم؛ فقط برای جلوگیری از هنگ کامل سرویس، یه سقف
+        # کلی (نه به‌ازای هر پیام) می‌ذاریم که اگه هیچ‌کدوم نیومد، خطای واضح بده.
+        try:
+            await asyncio.wait_for(drain_session(session), timeout=overall_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[gemini_live] سقف زمانی {overall_timeout:.0f}s رسید؛ {len(out_chunks)} تکه صدا تا الان جمع شده")
+
+    logger.info(f"[gemini_live] مجموع پیام‌های دریافتی: {message_count}, تکه‌های صدا: {len(out_chunks)}")
 
     if not out_chunks:
         raise RuntimeError("Gemini Live API هیچ صدایی برنگردوند")
@@ -556,8 +594,22 @@ def _run_gemini_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg pcm extract failed: {result.stderr}")
 
+    # مرحله‌ی کمکی: با VAD خودِ whisper (سبک، فقط برای زمان‌بندی - نه ترجمه)
+    # می‌فهمیم گفتار واقعی تا کجای فایل ادامه داره، تا سقف زمانی صبر برای
+    # Gemini رو هوشمندانه تنظیم کنیم (نه یه عدد ثابت حدسی)
+    logger.info(f"[{req.content_id}] (Gemini) مرحله ۴.۵: تخمین طول گفتار واقعی با VAD")
+    wav_for_vad = job_dir / "audio_for_vad.wav"
+    extract_audio(video_path, wav_for_vad)
+    try:
+        vad_segments, _ = transcribe_segments(wav_for_vad)
+        expected_speech_duration = vad_segments[-1]["end"] if vad_segments else total_duration
+    except Exception:
+        logger.warning(f"[{req.content_id}] (Gemini) تخمین VAD ناموفق بود، از طول کل ویدیو استفاده میشه")
+        expected_speech_duration = total_duration
+    logger.info(f"[{req.content_id}] (Gemini) آخرین گفتار تشخیص‌داده‌شده تا ثانیه‌ی {expected_speech_duration:.1f}")
+
     logger.info(f"[{req.content_id}] (Gemini) مرحله ۵: ارسال صدا به Gemini Live API و دریافت دوبله")
-    asyncio.run(gemini_live_dub(pcm_audio_path, dubbed_audio_path))
+    asyncio.run(gemini_live_dub(pcm_audio_path, dubbed_audio_path, expected_speech_duration))
 
     logger.info(f"[{req.content_id}] (Gemini) مرحله ۶: ترکیب نهایی با ویدیو")
     merge_audio_with_video(video_path, dubbed_audio_path, output_path)
