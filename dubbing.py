@@ -261,6 +261,8 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path) -> None:
     pcm_bytes = pcm_audio_path.read_bytes()
     chunk_size = 4096
     out_chunks: list[bytes] = []
+    silence_turns_in_a_row = 0
+    max_idle_turns = 2  # اگه ۲ بار پشت سر هم هیچ صدای جدیدی نیومد، یعنی واقعا تموم شده
 
     async with client.aio.live.connect(model=model, config=config) as session:
         for i in range(0, len(pcm_bytes), chunk_size):
@@ -270,9 +272,16 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path) -> None:
             )
         await session.send_realtime_input(audio_stream_end=True)
 
-        async for response in session.receive():
-            if getattr(response, "data", None):
-                out_chunks.append(response.data)
+        # Live API مکالمه‌ای/نوبتی کار می‌کنه: بعد از هر مکث، یه "نوبت" جواب می‌ده
+        # و session.receive() برای همون یه نوبت برمی‌گرده. برای گرفتن کل فایل
+        # (نه فقط جمله‌های اول)، باید چندبار پشت سر هم منتظر نوبت‌های بعدی بمونیم.
+        while silence_turns_in_a_row < max_idle_turns:
+            got_data_this_turn = False
+            async for response in session.receive():
+                if getattr(response, "data", None):
+                    out_chunks.append(response.data)
+                    got_data_this_turn = True
+            silence_turns_in_a_row = 0 if got_data_this_turn else silence_turns_in_a_row + 1
 
     if not out_chunks:
         raise RuntimeError("Gemini Live API هیچ صدایی برنگردوند")
