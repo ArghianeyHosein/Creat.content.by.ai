@@ -195,9 +195,22 @@ def transcribe_segments(audio_path: Path) -> tuple[list[dict], str]:
     return segments, info.language
 
 
-def translate_to_persian(text: str) -> str:
-    """ترجمه متن به فارسی با فراخوانی مستقیم REST API میسترال (بدون نیاز به SDK رسمی)"""
+def translate_to_persian(text: str, max_syllables: int | None = None) -> str:
+    """
+    ترجمه متن به فارسی با فراخوانی مستقیم REST API میسترال (بدون نیاز به SDK رسمی).
+    اگه max_syllables داده بشه، از مدل می‌خوایم ترجمه رو تا حد امکان هم‌طول با
+    متن اصلی نگه داره - تا کمتر لازم بشه صدای TTS رو بعداً فشرده کنیم (که باعث
+    غیرطبیعی سریع شدن صدا میشه).
+    """
     import httpx
+
+    length_hint = ""
+    if max_syllables:
+        length_hint = (
+            f"\n\nمهم: ترجمه باید کوتاه و فشرده باشه، تقریباً هم‌طول با جمله‌ی اصلی "
+            f"(حدود {max_syllables} هجا یا کمتر)، طوری که با همون سرعت طبیعی گفتار "
+            f"قابل خوندن باشه. از کلمات اضافی و پرکننده پرهیز کن، ولی معنی رو کامل حفظ کن."
+        )
 
     resp = httpx.post(
         "https://api.mistral.ai/v1/chat/completions",
@@ -209,7 +222,7 @@ def translate_to_persian(text: str) -> str:
             "model": "mistral-small-latest",
             "messages": [{
                 "role": "user",
-                "content": f"این متن رو فقط ترجمه کن به فارسی روان، بدون هیچ توضیح اضافه:\n\n{text}",
+                "content": f"این متن رو فقط ترجمه کن به فارسی روان، بدون هیچ توضیح اضافه:{length_hint}\n\n{text}",
             }],
         },
         timeout=30,
@@ -370,7 +383,10 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
     for i, seg in enumerate(raw_segments):
         logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: {seg['text']}")
         original_full_text_parts.append(seg["text"])
-        persian_text = translate_to_persian(seg["text"])
+
+        window = max(0.3, seg["end"] - seg["start"])
+        syllable_budget = max(3, int(window * 4.5))  # تخمین تقریبی: ~۴.۵ هجا در ثانیه گفتار طبیعی
+        persian_text = translate_to_persian(seg["text"], max_syllables=syllable_budget)
         persian_full_text_parts.append(persian_text)
 
         raw_tts_path = job_dir / f"seg_{i}_raw.mp3"
@@ -378,7 +394,6 @@ def _run_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
         logger.info(f"[{req.content_id}] جمله {i+1}/{len(raw_segments)}: TTS")
         asyncio.run(synthesize_speech(persian_text, gender, raw_tts_path))
 
-        window = max(0.3, seg["end"] - seg["start"])
         fit_segment_to_window(raw_tts_path, window, fitted_path)
 
         # اگه جمله‌ی قبلی تا بعد از شروع این جمله ادامه داشته، این یکی رو عقب می‌ندازیم
