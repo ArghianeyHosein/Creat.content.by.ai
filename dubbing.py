@@ -625,19 +625,10 @@ def _run_gemini_dubbing_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg pcm extract failed: {result.stderr}")
 
-    # مرحله‌ی کمکی: با VAD خودِ whisper (سبک، فقط برای زمان‌بندی - نه ترجمه)
-    # می‌فهمیم گفتار واقعی تا کجای فایل ادامه داره، تا سقف زمانی صبر برای
-    # Gemini رو هوشمندانه تنظیم کنیم (نه یه عدد ثابت حدسی)
-    logger.info(f"[{req.content_id}] (Gemini) مرحله ۴.۵: تخمین طول گفتار واقعی با VAD")
-    wav_for_vad = job_dir / "audio_for_vad.wav"
-    extract_audio(video_path, wav_for_vad)
-    try:
-        vad_segments, _ = transcribe_segments(wav_for_vad)
-        expected_speech_duration = vad_segments[-1]["end"] if vad_segments else total_duration
-    except Exception:
-        logger.warning(f"[{req.content_id}] (Gemini) تخمین VAD ناموفق بود، از طول کل ویدیو استفاده میشه")
-        expected_speech_duration = total_duration
-    logger.info(f"[{req.content_id}] (Gemini) آخرین گفتار تشخیص‌داده‌شده تا ثانیه‌ی {expected_speech_duration:.1f}")
+    # از طول کل ویدیو به‌عنوان تخمین سقف زمانی استفاده می‌کنیم (نه یه پاس اضافه‌ی
+    # whisper برای VAD - اون پاس اضافه باعث می‌شد whisper + اتصال Gemini همزمان
+    # حافظه مصرف کنن و سرویس با OOM کرش کنه)
+    expected_speech_duration = total_duration
 
     logger.info(f"[{req.content_id}] (Gemini) مرحله ۵: ارسال صدا به Gemini Live API و دریافت دوبله")
     asyncio.run(gemini_live_dub(pcm_audio_path, dubbed_audio_path, expected_speech_duration))
