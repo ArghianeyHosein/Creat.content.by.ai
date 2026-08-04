@@ -228,8 +228,10 @@ def fit_segment_to_window(raw_audio_path: Path, target_duration: float, out_path
     بعدی قاطی نشه. همچنین به مونو/۲۴کیلوهرتز نرمالایز می‌شه تا mix بعدی یکدست باشه.
     """
     actual = ffprobe_duration(raw_audio_path)
-    if target_duration > 0.05 and actual > target_duration * 1.1:
-        factor = min(actual / target_duration, 2.0)
+    if target_duration > 0.05 and actual > target_duration * 1.15:
+        # حداکثر ۱.۳ برابر سریع‌تر - ترجیح میدیم صدا کمی از بازه‌ی زمانی جمله
+        # بیرون بزنه تا اینکه غیرطبیعی و عجول به‌نظر برسه
+        factor = min(actual / target_duration, 1.3)
         cmd = [
             "ffmpeg", "-y", "-i", str(raw_audio_path),
             "-filter:a", f"atempo={factor:.3f}",
