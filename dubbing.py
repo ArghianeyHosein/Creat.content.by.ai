@@ -260,19 +260,13 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path, expected_
             "تو یک مترجم صوتی همزمان هستی. هرچی که می‌شنوی رو بلافاصله و با لحن، "
             "احساس و سرعت گفتار مشابه گوینده‌ی اصلی، به زبان فارسی روان ترجمه کن و بگو."
         ),
-        # تنظیم قبلی (فقط disabled=True) هیچ تأثیری نداشت - نتیجه‌ی تست عیناً
-        # همون قبلی بود. این‌بار علاوه بر خاموش کردن تشخیص خودکار، صریحاً هم
-        # می‌گیم even اگه فعالیت جدید تشخیص داده شد، جواب رو قطع نکن
-        # (activity_handling=NO_INTERRUPTION) - این فیلد جداست و شاید غایب بودنش
-        # دلیل بی‌اثر بودن اصلاح قبلی بوده.
-        realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True),
-            activity_handling=types.ActivityHandling.NO_INTERRUPTION,
-        ),
+        # برگردوندیم به تشخیص خودکار مکالمه (VAD پیش‌فرض گوگل). نسخه‌ی قبلی که
+        # VAD رو خاموش کرده بودیم و کل صدا رو یه "نوبت واحد" می‌دادیم، مشکل قطع
+        # زودهنگام رو حل کرد ولی باعث شد کل متن رو یک‌نفس و پشت‌سرهم بخونه، بدون
+        # رعایت مکث‌های طبیعی ویدیوی اصلی. با VAD خودکار، هر مکث واقعی باعث یه
+        # "نوبت" جدا میشه و فاصله‌ی طبیعی بین جمله‌ها حفظ می‌مونه.
     )
-    # لاگ می‌کنیم تا مطمئن بشیم این تنظیمات واقعاً روی آبجکت config نشستن،
-    # نه اینکه بی‌صدا نادیده گرفته شده باشن (همون چیزی که دفعه‌ی قبل رخ داد)
-    logger.info(f"[gemini_live] realtime_input_config ساخته‌شده: {config.realtime_input_config!r}")
+    logger.info("[gemini_live] با VAD خودکار (پیش‌فرض) و ورودی با تایمینگ نزدیک به واقعی")
 
     # سقف زمانی هوشمند: دو برابر طول واقعی گفتار (چون تولید صدا معمولاً کندتر از
     # پخش بلادرنگه) + یه حاشیه‌ی امن، به‌جای عدد ثابت حدسی
@@ -281,11 +275,19 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path, expected_
 
     pcm_bytes = pcm_audio_path.read_bytes()
     chunk_size = 4096
+    # با نرخ نمونه‌برداری ۱۶kHz و ۱۶بیت مونو، هر ثانیه صدا = ۳۲۰۰۰ بایت
+    bytes_per_second = 32000
     out_chunks: list[bytes] = []
     message_count = 0
+    turns_completed = 0
 
     async def drain_session(session) -> None:
-        nonlocal message_count
+        """
+        همه‌ی پیام‌ها رو تا وقتی جریان طبیعتاً تموم بشه (StopAsyncIteration) می‌خونیم.
+        چون VAD خودکار روشنه، هر مکث واقعی یه "نوبت" جدا تولید می‌کنه - نه اینکه
+        بعد از اولین turn_complete خارج بشیم، منتظر نوبت‌های بعدی هم می‌مونیم.
+        """
+        nonlocal message_count, turns_completed
         turn_iter = session.receive().__aiter__()
         while True:
             try:
@@ -310,32 +312,35 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path, expected_
             if has_data:
                 out_chunks.append(response.data)
 
-            # اگه سیگنال صریح "تموم شدن نوبت" اومد و دیگه چیزی نمونده، خارج شو
             if turn_complete or generation_complete:
-                logger.info("[gemini_live] سیگنال پایان دریافت شد، خروج از حلقه")
-                break
+                turns_completed += 1
+                logger.info(f"[gemini_live] نوبت #{turns_completed} تموم شد، منتظر نوبت بعدی می‌مونیم")
 
-    async with client.aio.live.connect(model=model, config=config) as session:
-        # چون تشخیص خودکار مکالمه رو خاموش کردیم، باید خودمون صریح بگیم
-        # "نوبت کاربر شروع شد" و "نوبت کاربر تموم شد"
-        await session.send_realtime_input(activity_start=types.ActivityStart())
+    async def send_audio(session) -> None:
+        # صدا رو با فاصله‌ی زمانی نزدیک به سرعت واقعی پخش می‌فرستیم (نه یک‌جا و
+        # فوری)، چون این API برای صدای زنده/میکروفون بهینه شده و VAD خودکارش
+        # با ورودی هم‌زمان با محتوا بهتر مکث‌های واقعی رو تشخیص می‌ده
         for i in range(0, len(pcm_bytes), chunk_size):
             chunk = pcm_bytes[i:i + chunk_size]
             await session.send_realtime_input(
                 audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
             )
-        await session.send_realtime_input(activity_end=types.ActivityEnd())
+            await asyncio.sleep(len(chunk) / bytes_per_second)
         await session.send_realtime_input(audio_stream_end=True)
+        logger.info("[gemini_live] ارسال کل صدا تموم شد")
 
-        # به‌جای حدس زدن با timeout کور، منتظر سیگنال واقعی پایان (turn_complete /
-        # generation_complete) می‌مونیم؛ فقط برای جلوگیری از هنگ کامل سرویس، یه سقف
-        # کلی (نه به‌ازای هر پیام) می‌ذاریم که اگه هیچ‌کدوم نیومد، خطای واضح بده.
+    async with client.aio.live.connect(model=model, config=config) as session:
+        # ارسال و دریافت رو همزمان اجرا می‌کنیم (نه اول کامل بفرستیم بعد بگیریم)
+        # چون API دوطرفه‌ست و ممکنه مدل وسط ارسال، به یه مکث واقعی جواب بده
+        send_task = asyncio.create_task(send_audio(session))
         try:
             await asyncio.wait_for(drain_session(session), timeout=overall_timeout)
         except asyncio.TimeoutError:
             logger.warning(f"[gemini_live] سقف زمانی {overall_timeout:.0f}s رسید؛ {len(out_chunks)} تکه صدا تا الان جمع شده")
+        if not send_task.done():
+            send_task.cancel()
 
-    logger.info(f"[gemini_live] مجموع پیام‌های دریافتی: {message_count}, تکه‌های صدا: {len(out_chunks)}")
+    logger.info(f"[gemini_live] مجموع پیام‌های دریافتی: {message_count}, نوبت‌های کامل‌شده: {turns_completed}, تکه‌های صدا: {len(out_chunks)}")
 
     if not out_chunks:
         raise RuntimeError("Gemini Live API هیچ صدایی برنگردوند")
