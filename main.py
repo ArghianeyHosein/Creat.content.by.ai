@@ -19,7 +19,7 @@
 یعنی اگه فقط کوکی اینستاگرام رو داری، یوتیوب همچنان (با همون مشکل قبلی)
 بدون‌کوکی امتحان می‌شه.
 """
-from instagram_test_login 
+import from instagram_test_login 
 import router as instagram_router
 import os
 import re
