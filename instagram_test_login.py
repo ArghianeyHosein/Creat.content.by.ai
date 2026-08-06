@@ -1,13 +1,14 @@
-# این کد رو به فایل اصلی سرویس FastAPI (همون‌جایی که بقیه‌ی اندپوینت‌ها مثل /dub هستن) اضافه کن.
-# اگه instagrapi توی requirements.txt نیست، این خط رو بهش اضافه کن: instagrapi
-
 import base64
-from fastapi import HTTPException, Header, Request
+import os
+from fastapi import APIRouter, HTTPException, Header, Request
 from instagrapi import Client
+
+API_KEY = os.environ.get("API_KEY")
+
+router = APIRouter()
 
 
 def parse_netscape_cookies(cookie_text: str) -> dict:
-    """فایل کوکی به فرمت Netscape (خط به خط، tab-separated) رو به دیکشنری تبدیل می‌کنه."""
     cookies = {}
     for line in cookie_text.splitlines():
         line = line.strip()
@@ -20,9 +21,8 @@ def parse_netscape_cookies(cookie_text: str) -> dict:
     return cookies
 
 
-@app.post("/instagram/test-login")
+@router.post("/instagram/test-login")
 async def test_instagram_login(request: Request, x_api_key: str = Header(None)):
-    # همون الگوی احراز هویت بقیه‌ی اندپوینت‌های سرویس
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
