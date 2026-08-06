@@ -391,7 +391,155 @@ def transcribe_segments(audio_path: Path) -> tuple[list[dict], str]:
     return segments, info.language
 
 
-def translate_to_persian(text: str, max_syllables: int | None = None) -> str:
+async def gemini_dub_single_segment(pcm_audio_path: Path, output_wav_path: Path, timeout_seconds: float = 30.0) -> None:
+    """
+    نسخه‌ی ساده‌شده‌ی gemini_live_dub، مخصوص یه قطعه‌ی صوتی کوتاه (یه جمله).
+    یه اتصال تازه به Live API باز می‌کنه، صدا رو می‌فرسته، فقط منتظر **یک نوبت**
+    می‌مونه (چون طبق شواهد، نوبت اول توی یه session تازه همیشه تمیز کار می‌کنه)،
+    و بعد اتصال رو می‌بنده. این از پیچیدگی مدیریت چند-نوبته توی یه session طولانی
+    (که هربار یه شکل جدید خراب می‌شد) دوری می‌کنه.
+    """
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    model = "gemini-2.5-flash-native-audio-preview-12-2025"
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=(
+            "تو یک مترجم صوتی همزمان هستی. هرچی که می‌شنوی رو بلافاصله و با لحن، "
+            "احساس و سرعت گفتار مشابه گوینده‌ی اصلی، به زبان فارسی روان ترجمه کن و بگو."
+        ),
+    )
+
+    pcm_bytes = pcm_audio_path.read_bytes()
+    chunk_size = 4096
+    out_chunks: list[bytes] = []
+
+    async def drain_first_turn(session) -> None:
+        turn_iter = session.receive().__aiter__()
+        while True:
+            try:
+                response = await turn_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            server_content = getattr(response, "server_content", None)
+            turn_complete = getattr(server_content, "turn_complete", None)
+            generation_complete = getattr(server_content, "generation_complete", None)
+            if getattr(response, "data", None):
+                out_chunks.append(response.data)
+            if turn_complete or generation_complete:
+                break
+
+    async with client.aio.live.connect(model=model, config=config) as session:
+        for i in range(0, len(pcm_bytes), chunk_size):
+            chunk = pcm_bytes[i:i + chunk_size]
+            await session.send_realtime_input(
+                audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+            )
+        await session.send_realtime_input(audio_stream_end=True)
+        try:
+            await asyncio.wait_for(drain_first_turn(session), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            logger.warning(f"[gemini_segment] سقف {timeout_seconds}s رسید، {len(out_chunks)} تکه صدا تا الان")
+
+    if not out_chunks:
+        raise RuntimeError("Gemini Live API برای این قطعه هیچ صدایی برنگردوند")
+
+    raw_out_path = pcm_audio_path.with_suffix(".gemini_raw.pcm")
+    raw_out_path.write_bytes(b"".join(out_chunks))
+    cmd = [
+        "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
+        "-i", str(raw_out_path), str(output_wav_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg convert gemini segment output failed: {result.stderr}")
+
+
+def _run_gemini_segment_pipeline(req: "DubRequest", job_dir: Path) -> "DubResult":
+    """
+    ترکیب بهترین بخش هر دو مسیر: از whisper فقط برای پیدا کردن مرز جمله‌ها
+    (timing) استفاده می‌کنیم - نه ترجمه - و برای هر جمله یه اتصال تازه و
+    مستقل به Gemini Live API باز می‌کنیم (که می‌دونیم نوبت اول همیشه تمیزه).
+    نتیجه‌ها با همون build_timed_audio_track سر زمان درستشون چیده میشن.
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY تنظیم نشده روی سرویس")
+
+    video_path = job_dir / "input.mp4"
+    audio_path = job_dir / "audio.wav"
+    dubbed_track_path = job_dir / "dubbed_track.wav"
+    output_path = job_dir / "output.mp4"
+
+    logger.info(f"[{req.content_id}] (Gemini-Segment) مرحله ۱-۳: دانلود و اعتبارسنجی")
+    early_result, total_duration = download_and_validate_video(req, video_path)
+    if early_result is not None:
+        return early_result
+
+    logger.info(f"[{req.content_id}] (Gemini-Segment) مرحله ۴: جدا کردن صدا")
+    extract_audio(video_path, audio_path)
+
+    logger.info(f"[{req.content_id}] (Gemini-Segment) مرحله ۵: پیدا کردن مرز جمله‌ها با whisper (فقط timing)")
+    raw_segments, detected_lang = transcribe_segments(audio_path)
+    original_language = req.original_language or detected_lang
+    logger.info(f"[{req.content_id}] (Gemini-Segment) زبان: {original_language}, تعداد جمله: {len(raw_segments)}")
+
+    dubbed_segments = []
+    cursor = 0.0
+
+    for i, seg in enumerate(raw_segments):
+        window = max(0.3, seg["end"] - seg["start"])
+        logger.info(f"[{req.content_id}] (Gemini-Segment) جمله {i+1}/{len(raw_segments)}: {seg['text']}")
+
+        seg_audio = job_dir / f"seg_{i}_src.wav"
+        seg_pcm = job_dir / f"seg_{i}_src.pcm"
+        seg_gemini_out = job_dir / f"seg_{i}_gemini.wav"
+        fitted_path = job_dir / f"seg_{i}_fitted.wav"
+
+        # برش قطعه‌ی صوتیِ زبان اصلی برای همین جمله
+        cmd = [
+            "ffmpeg", "-y", "-i", str(audio_path),
+            "-ss", str(seg["start"]), "-to", str(seg["end"]),
+            str(seg_audio),
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+        cmd = [
+            "ffmpeg", "-y", "-i", str(seg_audio),
+            "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            str(seg_pcm),
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+
+        try:
+            asyncio.run(gemini_dub_single_segment(seg_pcm, seg_gemini_out))
+        except Exception as e:
+            logger.warning(f"[{req.content_id}] (Gemini-Segment) جمله {i+1} ناموفق بود، رد میشه: {e}")
+            continue
+
+        fit_segment_to_window(seg_gemini_out, window, fitted_path)
+
+        actual_start = max(seg["start"], cursor)
+        fitted_duration = ffprobe_duration(fitted_path)
+        cursor = actual_start + fitted_duration
+        dubbed_segments.append({"start": actual_start, "path": fitted_path})
+
+    logger.info(f"[{req.content_id}] (Gemini-Segment) مرحله ۶: چیدن قطعات سر زمان درستشون")
+    build_timed_audio_track(dubbed_segments, total_duration, dubbed_track_path)
+
+    logger.info(f"[{req.content_id}] (Gemini-Segment) مرحله ۷: ترکیب نهایی با ویدیو")
+    merge_audio_with_video(video_path, dubbed_track_path, output_path)
+
+    logger.info(f"[{req.content_id}] (Gemini-Segment) تمام شد ✅")
+    return DubResult(
+        content_id=req.content_id,
+        original_transcript=" ".join(s["text"] for s in raw_segments),
+        dubbed_transcript=None,  # این مسیر متن ترجمه‌شده رو جدا برنمی‌گردونه، فقط صدا
+        original_language=original_language,
+        local_output_path=str(output_path),
+    )
+
+
     """
     ترجمه متن به فارسی با فراخوانی مستقیم REST API میسترال (بدون نیاز به SDK رسمی).
     اگه max_syllables داده بشه، از مدل می‌خوایم ترجمه رو تا حد امکان هم‌طول با
@@ -783,6 +931,38 @@ async def process_dubbing_gemini(req: DubRequest):
     asyncio.create_task(asyncio.to_thread(_run_gemini_dubbing_job, job_id, req, job_dir))
 
     return JobAccepted(job_id=job_id, content_id=req.content_id)
+
+
+def _run_gemini_segment_job(job_id: str, req: "DubRequest", job_dir: Path) -> None:
+    """نسخه‌ی پس‌زمینه‌ی پایپ‌لاین ترکیبی (whisper timing + هر جمله یه session تازه‌ی Gemini)"""
+    try:
+        result = _run_gemini_segment_pipeline(req, job_dir)
+        JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="done", result=result)
+    except Exception as e:
+        logger.exception(f"[{req.content_id}] خطا در فرآیند دوبله (Gemini-Segment)")
+        JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="failed", error=str(e))
+
+
+@router.post("/process-gemini-segment", response_model=JobAccepted, status_code=202)
+async def process_dubbing_gemini_segment(req: DubRequest):
+    """
+    نسخه‌ی ترکیبی (آزمایشی): مرز جمله‌ها با whisper پیدا میشه (فقط timing، نه ترجمه)،
+    و برای هر جمله یه اتصال کاملاً تازه به Gemini Live API باز میشه (نوبت اول -
+    که طبق شواهد همیشه تمیز کار می‌کنه). نتیجه‌ها با build_timed_audio_track سر
+    زمان درستشون چیده میشن. نیاز به GEMINI_API_KEY روی سرویس.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY تنظیم نشده روی سرویس")
+
+    job_id = str(uuid.uuid4())
+    job_dir = WORK_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    JOBS[job_id] = JobStatus(job_id=job_id, content_id=req.content_id, status="processing")
+    asyncio.create_task(asyncio.to_thread(_run_gemini_segment_job, job_id, req, job_dir))
+
+    return JobAccepted(job_id=job_id, content_id=req.content_id)
+
 
 
 @router.get("/status/{job_id}", response_model=JobStatus)
