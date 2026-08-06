@@ -9,3 +9,4 @@ httpx
 numpy
 google-genai
 instagrapi
+requests
