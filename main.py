@@ -19,7 +19,8 @@
 یعنی اگه فقط کوکی اینستاگرام رو داری، یوتیوب همچنان (با همون مشکل قبلی)
 بدون‌کوکی امتحان می‌شه.
 """
-
+from instagram_test_login 
+import router as instagram_router
 import os
 import re
 import json
@@ -36,6 +37,7 @@ from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Query
 from fastapi.responses import FileResponse
 
 app = FastAPI(title="Media Downloader (YouTube + Instagram)")
+app.include_router(instagram_router)
 
 # کلید امنیتی از متغیر محیطی خونده می‌شه (تو تنظیمات Render ست می‌کنیم)
 API_KEY = os.environ.get("API_KEY", "")
