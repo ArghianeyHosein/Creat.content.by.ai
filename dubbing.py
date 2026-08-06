@@ -280,12 +280,16 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path, expected_
     out_chunks: list[bytes] = []
     message_count = 0
     turns_completed = 0
+    can_send = asyncio.Event()
+    can_send.set()  # اولش اجازه‌ی ارسال داریم
 
     async def drain_session(session) -> None:
         """
         همه‌ی پیام‌ها رو تا وقتی جریان طبیعتاً تموم بشه (StopAsyncIteration) می‌خونیم.
         چون VAD خودکار روشنه، هر مکث واقعی یه "نوبت" جدا تولید می‌کنه - نه اینکه
         بعد از اولین turn_complete خارج بشیم، منتظر نوبت‌های بعدی هم می‌مونیم.
+        هروقت مدل شروع به تولید صدا کرد، ارسال رو موقتاً متوقف می‌کنیم (can_send.clear)
+        تا صدای بعدی وسط جواب مدل نره و "نوبت بعدی" رو زودهنگام قطع نکنه.
         """
         nonlocal message_count, turns_completed
         turn_iter = session.receive().__aiter__()
@@ -310,17 +314,21 @@ async def gemini_live_dub(pcm_audio_path: Path, output_wav_path: Path, expected_
             )
 
             if has_data:
+                if can_send.is_set():
+                    can_send.clear()  # مدل شروع به حرف زدن کرد؛ فعلاً چیزی نفرست
                 out_chunks.append(response.data)
 
             if turn_complete or generation_complete:
                 turns_completed += 1
-                logger.info(f"[gemini_live] نوبت #{turns_completed} تموم شد، منتظر نوبت بعدی می‌مونیم")
+                logger.info(f"[gemini_live] نوبت #{turns_completed} تموم شد، اجازه‌ی ارسال دوباره باز شد")
+                can_send.set()  # نوبت تموم شد؛ حالا می‌تونیم صدای بعدی رو بفرستیم
 
     async def send_audio(session) -> None:
         # صدا رو با فاصله‌ی زمانی نزدیک به سرعت واقعی پخش می‌فرستیم (نه یک‌جا و
-        # فوری)، چون این API برای صدای زنده/میکروفون بهینه شده و VAD خودکارش
-        # با ورودی هم‌زمان با محتوا بهتر مکث‌های واقعی رو تشخیص می‌ده
+        # فوری)، و هروقت مدل داره جواب یه نوبت رو تولید می‌کنه، صبر می‌کنیم
+        # (دقیقاً مثل مکالمه‌ی واقعی: وقتی طرف مقابل حرف می‌زنه، ساکت می‌مونیم)
         for i in range(0, len(pcm_bytes), chunk_size):
+            await can_send.wait()
             chunk = pcm_bytes[i:i + chunk_size]
             await session.send_realtime_input(
                 audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
