@@ -8,3 +8,4 @@ mistralai
 httpx
 numpy
 google-genai
+instagrapi
