@@ -1,5 +1,6 @@
 import base64
 import os
+import subprocess
 import tempfile
 import requests
 from fastapi import APIRouter, HTTPException, Header, Request
@@ -33,6 +34,17 @@ def download_to_temp(url: str, suffix: str = ".mp4") -> str:
     return tmp.name
 
 
+def generate_thumbnail(video_path: str) -> str:
+    """با ffmpeg (که قبلاً برای دابینگ روی سرویس نصبه) یک فریم از ویدیو رو به‌عنوان thumbnail می‌گیره."""
+    thumb_path = video_path + ".jpg"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01", "-vframes", "1", thumb_path],
+        check=True,
+        capture_output=True,
+    )
+    return thumb_path
+
+
 @router.post("/instagram/publish")
 async def publish_instagram(request: Request, x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
@@ -51,7 +63,6 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
     if not post_feed and not post_story:
         return {"success": False, "stage": "input", "error": "نه post_feed نه post_story فعال نیست"}
 
-    # مرحله ۱: دیکود کوکی و لاگین
     try:
         cookie_text = base64.b64decode(cookie_b64).decode("utf-8")
         cookies = parse_netscape_cookies(cookie_text)
@@ -63,37 +74,46 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
     except Exception as e:
         return {"success": False, "stage": "login", "error": str(e)}
 
-    # مرحله ۲: دانلود فایل ویدیو از presigned_url
     try:
         video_path = download_to_temp(presigned_url)
     except Exception as e:
         return {"success": False, "stage": "download", "error": str(e)}
 
+    thumb_path = None
+    try:
+        thumb_path = generate_thumbnail(video_path)
+    except Exception:
+        thumb_path = None  # اگه ساخت thumbnail شکست خورد، بدون اون امتحان می‌کنیم
+
     result = {"success": True, "feed": None, "story": None}
 
-    # مرحله ۳: آپلود به فید (اگه فعال باشه)
     if post_feed:
         try:
-            media = cl.clip_upload(video_path, caption)
+            if thumb_path:
+                media = cl.clip_upload(video_path, caption, thumbnail=thumb_path)
+            else:
+                media = cl.clip_upload(video_path, caption)
             result["feed"] = {"success": True, "media_id": str(media.pk), "code": media.code}
         except Exception as e:
             result["feed"] = {"success": False, "error": str(e)}
 
-    # مرحله ۴: آپلود به استوری (اگه فعال باشه)
     if post_story:
         try:
-            story = cl.video_upload_to_story(video_path, caption)
+            if thumb_path:
+                story = cl.video_upload_to_story(video_path, caption, thumbnail=thumb_path)
+            else:
+                story = cl.video_upload_to_story(video_path, caption)
             result["story"] = {"success": True, "media_id": str(story.pk)}
         except Exception as e:
             result["story"] = {"success": False, "error": str(e)}
 
-    # پاکسازی فایل موقت
-    try:
-        os.remove(video_path)
-    except Exception:
-        pass
+    for p in (video_path, thumb_path):
+        if p:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
-    # اگه هرکدوم که فعال بوده شکست خورده باشه، success کلی رو false کن
     if post_feed and result["feed"] and not result["feed"]["success"]:
         result["success"] = False
     if post_story and result["story"] and not result["story"]["success"]:
