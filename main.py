@@ -37,6 +37,9 @@ from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Query
 from fastapi.responses import FileResponse
 
 app = FastAPI(title="Media Downloader (YouTube + Instagram)")
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 app.include_router(instagram_router)
 app.include_router(instagram_publish_router)
 
