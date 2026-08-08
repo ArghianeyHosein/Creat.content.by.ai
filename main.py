@@ -155,11 +155,19 @@ def cookies_for_platform(platform: str) -> Optional[str]:
     return None
 
 
+PROXY_MAX_AGE_SECONDS = int(os.environ.get("PROXY_MAX_AGE_SECONDS", "86400"))
+
+
 def get_active_proxy() -> Optional[str]:
     """
-    پروکسی فعال (is_active=true) رو از جدول proxies توی Supabase می‌خونه
-    و به فرمت URL آماده برای yt-dlp (--proxy) برمی‌گردونه، مثلا:
-    http://user:pass@ip:port
+    پروکسی فعال رو (با در نظر گرفتن چرخش دوره‌ای) از Supabase می‌گیره و به
+    فرمت URL آماده برای yt-dlp (--proxy) برمی‌گردونه، مثلا: http://user:pass@ip:port
+
+    از تابع get_or_rotate_active_proxy توی Supabase استفاده می‌کنه که اگه
+    پروکسی فعال فعلی قدیمی‌تر از PROXY_MAX_AGE_SECONDS باشه (پیش‌فرض ۲۴
+    ساعت)، خودکار قبل از برگردوندن، به پروکسی بعدی می‌چرخه — یعنی یه
+    پروکسی سالم برای مدتی ثابت می‌مونه (پایداری کوکی/سشن)، ولی برای همیشه
+    روی یه IP قفل نمی‌مونه.
 
     اگه Supabase تنظیم نشده باشه، پروکسی‌ای فعال نباشه، یا هر خطای دیگه‌ای
     پیش بیاد، None برمی‌گردونه (یعنی بدون پروکسی تلاش می‌کنیم — سرویس نباید
@@ -168,16 +176,13 @@ def get_active_proxy() -> Optional[str]:
     if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
         return None
     try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/proxies",
-            params={
-                "select": "protocol,ip,port,username,password",
-                "is_active": "eq.true",
-                "limit": "1",
-            },
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/get_or_rotate_active_proxy",
+            json={"p_max_age_seconds": PROXY_MAX_AGE_SECONDS},
             headers={
                 "apikey": SUPABASE_SERVICE_ROLE_KEY,
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
             },
             timeout=10,
         )
@@ -187,10 +192,12 @@ def get_active_proxy() -> Optional[str]:
             return None
         row = rows[0]
         protocol = row.get("protocol") or "http"
-        ip = row["ip"]
-        port = row["port"]
+        ip = row.get("ip")
+        port = row.get("port")
         username = row.get("username")
         password = row.get("password")
+        if not (ip and port):
+            return None
         if username and password:
             return f"{protocol}://{username}:{password}@{ip}:{port}"
         return f"{protocol}://{ip}:{port}"
