@@ -6,6 +6,8 @@ import requests
 from fastapi import APIRouter, HTTPException, Header, Request
 from instagrapi import Client
 
+from proxy_utils import get_active_proxy_url
+
 API_KEY = os.environ.get("API_KEY")
 
 router = APIRouter()
@@ -70,6 +72,13 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
         if not sessionid:
             return {"success": False, "stage": "parse", "error": "sessionid توی کوکی‌ها پیدا نشد"}
         cl = Client()
+        # همون پروکسی فعالی که برای دور زدن بلاک IP رنج Render استفاده
+        # می‌کنیم (چه توی دانلود با yt-dlp، چه اینجا برای لاگین/پابلیش) —
+        # وگرنه instagrapi مستقیم از IP خود Render وصل می‌شه و همون خطای
+        # "Exceeded 30 redirects" (چالش امنیتی/بلاک) رو می‌گیره.
+        proxy_url = get_active_proxy_url()
+        if proxy_url:
+            cl.set_proxy(proxy_url)
         cl.login_by_sessionid(sessionid)
     except Exception as e:
         return {"success": False, "stage": "login", "error": str(e)}
