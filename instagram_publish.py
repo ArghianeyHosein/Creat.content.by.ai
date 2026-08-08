@@ -2,6 +2,7 @@ import base64
 import os
 import subprocess
 import tempfile
+import time
 import requests
 from fastapi import APIRouter, HTTPException, Header, Request
 from instagrapi import Client
@@ -107,14 +108,30 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
             result["feed"] = {"success": False, "error": str(e)}
 
     if post_story:
-        try:
-            if thumb_path:
-                story = cl.video_upload_to_story(video_path, caption, thumbnail=thumb_path)
-            else:
-                story = cl.video_upload_to_story(video_path, caption)
-            result["story"] = {"success": True, "media_id": str(story.pk)}
-        except Exception as e:
-            result["story"] = {"success": False, "error": str(e)}
+        # آپلود استوری گاهی به‌خاطر یه race condition شناخته‌شده توی instagrapi
+        # (configure موفق برمی‌گرده ولی مدیا هنوز attach نشده) با خطای
+        # "configure succeeded without media payload" fail می‌شه. این خطا
+        # گذراست، پس چند بار با یه فاصله‌ی کوتاه دوباره امتحان می‌کنیم.
+        story_max_attempts = 3
+        story_error = None
+        story_result = None
+        for attempt in range(1, story_max_attempts + 1):
+            try:
+                if thumb_path:
+                    story = cl.video_upload_to_story(video_path, caption, thumbnail=thumb_path)
+                else:
+                    story = cl.video_upload_to_story(video_path, caption)
+                story_result = {"success": True, "media_id": str(story.pk)}
+                story_error = None
+                break
+            except Exception as e:
+                story_error = str(e)
+                if attempt < story_max_attempts:
+                    time.sleep(10)  # کمی صبر تا اینستاگرام مدیا رو کامل پردازش کنه
+        if story_result:
+            result["story"] = story_result
+        else:
+            result["story"] = {"success": False, "error": story_error}
 
     for p in (video_path, thumb_path):
         if p:
