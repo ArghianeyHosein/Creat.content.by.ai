@@ -3,6 +3,8 @@ import os
 from fastapi import APIRouter, HTTPException, Header, Request
 from instagrapi import Client
 
+from proxy_utils import get_active_proxy_url
+
 API_KEY = os.environ.get("API_KEY")
 
 router = APIRouter()
@@ -48,6 +50,13 @@ async def test_instagram_login(request: Request, x_api_key: str = Header(None)):
 
     try:
         cl = Client()
+        # لاگین اینستاگرام هم باید از همون پروکسی فعال (که برای دور زدن
+        # بلاک IP رنج Render استفاده می‌کنیم) رد بشه، وگرنه instagrapi
+        # مستقیم از IP خود Render وصل می‌شه و همون خطای ریدایرکت/چالش
+        # امنیتی رو می‌گیره — حتی اگه دانلود از طریق yt-dlp مشکلی نداشته باشه.
+        proxy_url = get_active_proxy_url()
+        if proxy_url:
+            cl.set_proxy(proxy_url)
         cl.login_by_sessionid(sessionid)
         account = cl.account_info()
         return {
