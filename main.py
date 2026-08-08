@@ -18,6 +18,15 @@
 هرکدوم که ست نشده باشن، سرویس بدون کوکی (anonymous) تلاش می‌کنه —
 یعنی اگه فقط کوکی اینستاگرام رو داری، یوتیوب همچنان (با همون مشکل قبلی)
 بدون‌کوکی امتحان می‌شه.
+
+نکته‌ی پروکسی: برای دور زدن بلاک/rate-limit IP رنج Render روی اینستاگرام،
+سرویس قبل از هر دانلود/info، از جدول proxies توی Supabase پروکسی فعال
+(is_active=true) رو می‌خونه و به yt-dlp با فلگ --proxy می‌ده. برای این کار
+باید این دو Environment Variable روی خود سرویس Render ست بشن (نه n8n):
+  - SUPABASE_URL
+  - SUPABASE_SERVICE_ROLE_KEY
+اگه ست نشده باشن یا هیچ پروکسی فعالی توی جدول نباشه، سرویس بدون پروکسی
+(مستقیم) تلاش می‌کنه — یعنی این قابلیت اختیاریه و سرویس رو قطع نمی‌کنه.
 """
 from instagram_test_login import router as instagram_router
 from instagram_publish import router as instagram_publish_router
@@ -28,6 +37,7 @@ import uuid
 import base64
 import subprocess
 import mimetypes
+import requests
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +66,16 @@ B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
 B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
 B2_ENDPOINT = os.environ.get("B2_ENDPOINT", "")
 B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "")
+
+# اطلاعات Supabase — فقط برای خوندن پروکسی فعال از جدول proxies استفاده
+# می‌شه. این دو تا رو باید توی Environment Variables خود سرویس Render
+# ست کنی (این‌ها جدا از متغیرهای n8n هستن؛ n8n و Render محیط‌های اجرای
+# کاملاً جدایی دارن، پس ست‌کردن این مقادیر توی n8n روی این سرویس هیچ
+# اثری نداره):
+#   SUPABASE_URL              -> مثلا https://xxxxx.supabase.co
+#   SUPABASE_SERVICE_ROLE_KEY -> کلید service role از تنظیمات API پروژه Supabase
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 _s3_client = None
 
@@ -135,7 +155,50 @@ def cookies_for_platform(platform: str) -> Optional[str]:
     return None
 
 
-def build_command(platform: str, url: str, output_template: str) -> list:
+def get_active_proxy() -> Optional[str]:
+    """
+    پروکسی فعال (is_active=true) رو از جدول proxies توی Supabase می‌خونه
+    و به فرمت URL آماده برای yt-dlp (--proxy) برمی‌گردونه، مثلا:
+    http://user:pass@ip:port
+
+    اگه Supabase تنظیم نشده باشه، پروکسی‌ای فعال نباشه، یا هر خطای دیگه‌ای
+    پیش بیاد، None برمی‌گردونه (یعنی بدون پروکسی تلاش می‌کنیم — سرویس نباید
+    به‌خاطر این قطع بشه).
+    """
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        return None
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/proxies",
+            params={
+                "select": "protocol,ip,port,username,password",
+                "is_active": "eq.true",
+                "limit": "1",
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            return None
+        row = rows[0]
+        protocol = row.get("protocol") or "http"
+        ip = row["ip"]
+        port = row["port"]
+        username = row.get("username")
+        password = row.get("password")
+        if username and password:
+            return f"{protocol}://{username}:{password}@{ip}:{port}"
+        return f"{protocol}://{ip}:{port}"
+    except Exception:
+        return None
+
+
+def build_command(platform: str, url: str, output_template: str, proxy_url: Optional[str] = None) -> list:
     if platform == "youtube":
         cmd = [
             "yt-dlp",
@@ -148,6 +211,8 @@ def build_command(platform: str, url: str, output_template: str) -> list:
         ]
         if YOUTUBE_COOKIES_PATH:
             cmd += ["--cookies", YOUTUBE_COOKIES_PATH]
+        if proxy_url:
+            cmd += ["--proxy", proxy_url]
         return cmd
 
     if platform == "instagram":
@@ -162,12 +227,14 @@ def build_command(platform: str, url: str, output_template: str) -> list:
         ]
         if INSTAGRAM_COOKIES_PATH:
             cmd += ["--cookies", INSTAGRAM_COOKIES_PATH]
+        if proxy_url:
+            cmd += ["--proxy", proxy_url]
         return cmd
 
     raise HTTPException(status_code=400, detail="Unsupported URL (only YouTube and Instagram)")
 
 
-def build_info_command(platform: str, url: str) -> list:
+def build_info_command(platform: str, url: str, proxy_url: Optional[str] = None) -> list:
     """
     مثل build_command ولی به‌جای دانلود واقعی فایل، فقط متادیتا (کپشن،
     هشتگ و ...) رو به‌صورت JSON از yt-dlp می‌گیره. --skip-download یعنی
@@ -186,6 +253,8 @@ def build_info_command(platform: str, url: str) -> list:
     cookies_path = cookies_for_platform(platform)
     if cookies_path:
         cmd += ["--cookies", cookies_path]
+    if proxy_url:
+        cmd += ["--proxy", proxy_url]
     return cmd
 
 
@@ -219,7 +288,8 @@ def download_video(
     file_id = str(uuid.uuid4())
     output_template = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
-    cmd = build_command(platform, url, output_template)
+    proxy_url = get_active_proxy()
+    cmd = build_command(platform, url, output_template, proxy_url)
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=180)
@@ -261,7 +331,8 @@ def get_info(
     if platform == "unknown":
         raise HTTPException(status_code=400, detail="Only YouTube and Instagram URLs are supported")
 
-    cmd = build_info_command(platform, url)
+    proxy_url = get_active_proxy()
+    cmd = build_info_command(platform, url, proxy_url)
 
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
