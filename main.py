@@ -19,14 +19,12 @@
 یعنی اگه فقط کوکی اینستاگرام رو داری، یوتیوب همچنان (با همون مشکل قبلی)
 بدون‌کوکی امتحان می‌شه.
 
-نکته‌ی پروکسی: برای دور زدن بلاک/rate-limit IP رنج Render روی اینستاگرام،
-سرویس قبل از هر دانلود/info، از جدول proxies توی Supabase پروکسی فعال
-(is_active=true) رو می‌خونه و به yt-dlp با فلگ --proxy می‌ده. برای این کار
-باید این دو Environment Variable روی خود سرویس Render ست بشن (نه n8n):
-  - SUPABASE_URL
-  - SUPABASE_SERVICE_ROLE_KEY
-اگه ست نشده باشن یا هیچ پروکسی فعالی توی جدول نباشه، سرویس بدون پروکسی
-(مستقیم) تلاش می‌کنه — یعنی این قابلیت اختیاریه و سرویس رو قطع نمی‌کنه.
+نکته‌ی پروکسی: این سرویس دیگه خودش مستقیم به Supabase وصل نمی‌شه و پروکسی
+انتخاب/چرخش نمی‌کنه. تنها جایی که حق خوندن/تغییر دیتابیس رو داره n8n‌ه؛
+n8n پروکسی فعال رو از قبل تعیین و تست کرده و مستقیم به‌عنوان query
+parameter اختیاری به اسم proxy به /download و /info می‌فرسته (مثلاً
+proxy=http://user:pass@ip:port). اگه فرستاده نشه، سرویس بدون پروکسی
+(مستقیم) تلاش می‌کنه.
 """
 from instagram_test_login import router as instagram_router
 from instagram_publish import router as instagram_publish_router
@@ -66,16 +64,6 @@ B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
 B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
 B2_ENDPOINT = os.environ.get("B2_ENDPOINT", "")
 B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "")
-
-# اطلاعات Supabase — فقط برای خوندن پروکسی فعال از جدول proxies استفاده
-# می‌شه. این دو تا رو باید توی Environment Variables خود سرویس Render
-# ست کنی (این‌ها جدا از متغیرهای n8n هستن؛ n8n و Render محیط‌های اجرای
-# کاملاً جدایی دارن، پس ست‌کردن این مقادیر توی n8n روی این سرویس هیچ
-# اثری نداره):
-#   SUPABASE_URL              -> مثلا https://xxxxx.supabase.co
-#   SUPABASE_SERVICE_ROLE_KEY -> کلید service role از تنظیمات API پروژه Supabase
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 _s3_client = None
 
@@ -155,54 +143,7 @@ def cookies_for_platform(platform: str) -> Optional[str]:
     return None
 
 
-PROXY_MAX_AGE_SECONDS = int(os.environ.get("PROXY_MAX_AGE_SECONDS", "86400"))
 
-
-def get_active_proxy() -> Optional[str]:
-    """
-    پروکسی فعال رو (با در نظر گرفتن چرخش دوره‌ای) از Supabase می‌گیره و به
-    فرمت URL آماده برای yt-dlp (--proxy) برمی‌گردونه، مثلا: http://user:pass@ip:port
-
-    از تابع get_or_rotate_active_proxy توی Supabase استفاده می‌کنه که اگه
-    پروکسی فعال فعلی قدیمی‌تر از PROXY_MAX_AGE_SECONDS باشه (پیش‌فرض ۲۴
-    ساعت)، خودکار قبل از برگردوندن، به پروکسی بعدی می‌چرخه — یعنی یه
-    پروکسی سالم برای مدتی ثابت می‌مونه (پایداری کوکی/سشن)، ولی برای همیشه
-    روی یه IP قفل نمی‌مونه.
-
-    اگه Supabase تنظیم نشده باشه، پروکسی‌ای فعال نباشه، یا هر خطای دیگه‌ای
-    پیش بیاد، None برمی‌گردونه (یعنی بدون پروکسی تلاش می‌کنیم — سرویس نباید
-    به‌خاطر این قطع بشه).
-    """
-    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
-        return None
-    try:
-        resp = requests.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/get_or_rotate_active_proxy",
-            json={"p_max_age_seconds": PROXY_MAX_AGE_SECONDS},
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        rows = resp.json()
-        if not rows:
-            return None
-        row = rows[0]
-        protocol = row.get("protocol") or "http"
-        ip = row.get("ip")
-        port = row.get("port")
-        username = row.get("username")
-        password = row.get("password")
-        if not (ip and port):
-            return None
-        if username and password:
-            return f"{protocol}://{username}:{password}@{ip}:{port}"
-        return f"{protocol}://{ip}:{port}"
-    except Exception:
-        return None
 
 
 def build_command(platform: str, url: str, output_template: str, proxy_url: Optional[str] = None) -> list:
@@ -283,6 +224,7 @@ def download_video(
     url: str,
     background_tasks: BackgroundTasks,
     x_api_key: str = Header(default=""),
+    proxy: Optional[str] = Query(default=None, description="پروکسی که n8n از قبل تعیین/تست کرده، مثلا http://user:pass@ip:port"),
 ):
     # چک کلید امنیتی
     if not API_KEY or x_api_key != API_KEY:
@@ -295,8 +237,7 @@ def download_video(
     file_id = str(uuid.uuid4())
     output_template = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
-    proxy_url = get_active_proxy()
-    cmd = build_command(platform, url, output_template, proxy_url)
+    cmd = build_command(platform, url, output_template, proxy)
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=180)
@@ -325,6 +266,7 @@ def download_video(
 def get_info(
     url: str = Query(...),
     x_api_key: str = Header(default=""),
+    proxy: Optional[str] = Query(default=None, description="پروکسی که n8n از قبل تعیین/تست کرده، مثلا http://user:pass@ip:port"),
 ):
     """
     فقط متادیتای محتوا (کپشن، هشتگ) رو برمی‌گردونه، بدون دانلود فایل.
@@ -338,8 +280,7 @@ def get_info(
     if platform == "unknown":
         raise HTTPException(status_code=400, detail="Only YouTube and Instagram URLs are supported")
 
-    proxy_url = get_active_proxy()
-    cmd = build_info_command(platform, url, proxy_url)
+    cmd = build_info_command(platform, url, proxy)
 
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
