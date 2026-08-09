@@ -54,6 +54,39 @@ def get_active_proxy_url() -> Optional[str]:
         return None
 
 
+def log_error(source: str, message: str, job_id: str = None, details: dict = None) -> None:
+    """
+    خطا رو مستقیم و بی‌درنگ (synchronous) توی errors_notifications ثبت می‌کنه —
+    این کار قبل از هر تلاش/retry دیگه‌ای انجام می‌شه، چون اگه منتظر برگشتن
+    جواب HTTP به n8n بمونیم، ممکنه n8n زودتر timeout بزنه و خطا هیچ‌وقت
+    توی هیچ لاگی (جز لاگ خام Render) ثبت نشه.
+
+    اگه Supabase تنظیم نشده باشه یا خودِ این درخواست fail بشه، بی‌سروصدا رد
+    می‌شه — این نباید جریان اصلی رو مختل کنه.
+    """
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        return
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/errors_notifications",
+            json={
+                "job_id": job_id,
+                "level": "error",
+                "source": source,
+                "message": message,
+                "details": details or {},
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
 def rotate_proxy(status: str = "failed") -> None:
     """
     پروکسی فعال فعلی رو غیرفعال می‌کنه و پروکسی بعدی توی صف رو فعال می‌کنه
