@@ -52,3 +52,30 @@ def get_active_proxy_url() -> Optional[str]:
         return f"{protocol}://{ip}:{port}"
     except Exception:
         return None
+
+
+def rotate_proxy(status: str = "failed") -> None:
+    """
+    پروکسی فعال فعلی رو غیرفعال می‌کنه و پروکسی بعدی توی صف رو فعال می‌کنه
+    (همون تابع rotate_proxy توی Supabase که برای منطق چرخش دانلود هم
+    استفاده می‌شه). برای مواردی مثل خطای لاگین/JSONDecodeError که نشون‌دهنده‌ی
+    مشکل خودِ پروکسیه، نه صرفاً یه خطای گذرا.
+
+    اگه Supabase تنظیم نشده باشه یا خطایی پیش بیاد، بی‌سروصدا رد می‌شه —
+    این نباید جلوی جریان اصلی رو بگیره.
+    """
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        return
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/rotate_proxy",
+            json={"p_status": status},
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass
