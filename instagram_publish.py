@@ -7,7 +7,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Header, Request
 from instagrapi import Client
 
-from proxy_utils import get_active_proxy_url
+from proxy_utils import get_active_proxy_url, rotate_proxy
 
 API_KEY = os.environ.get("API_KEY")
 
@@ -72,17 +72,36 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
         sessionid = cookies.get("sessionid")
         if not sessionid:
             return {"success": False, "stage": "parse", "error": "sessionid توی کوکی‌ها پیدا نشد"}
-        cl = Client()
-        # همون پروکسی فعالی که برای دور زدن بلاک IP رنج Render استفاده
-        # می‌کنیم (چه توی دانلود با yt-dlp، چه اینجا برای لاگین/پابلیش) —
-        # وگرنه instagrapi مستقیم از IP خود Render وصل می‌شه و همون خطای
-        # "Exceeded 30 redirects" (چالش امنیتی/بلاک) رو می‌گیره.
-        proxy_url = get_active_proxy_url()
-        if proxy_url:
-            cl.set_proxy(proxy_url)
-        cl.login_by_sessionid(sessionid)
     except Exception as e:
-        return {"success": False, "stage": "login", "error": str(e)}
+        return {"success": False, "stage": "parse", "error": str(e)}
+
+    # لاگین گاهی به‌خاطر یه پروکسی خراب/ناپایدار (نه لزوماً کوکی نامعتبر)
+    # با خطاهایی مثل JSONDecodeError روی graphql/query fail می‌شه. تا
+    # LOGIN_MAX_ATTEMPTS بار تلاش می‌کنیم؛ هر بار که fail بشه، هم ۱۰ ثانیه
+    # صبر می‌کنیم و هم پروکسی رو می‌چرخونیم تا تلاش بعدی از یه IP تازه باشه.
+    LOGIN_MAX_ATTEMPTS = 3
+    cl = None
+    login_error = None
+    for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
+        try:
+            cl = Client()
+            # همون پروکسی فعالی که برای دور زدن بلاک IP رنج Render استفاده
+            # می‌کنیم (چه توی دانلود با yt-dlp، چه اینجا برای لاگین/پابلیش) —
+            # وگرنه instagrapi مستقیم از IP خود Render وصل می‌شه و همون خطای
+            # "Exceeded 30 redirects" (چالش امنیتی/بلاک) رو می‌گیره.
+            proxy_url = get_active_proxy_url()
+            if proxy_url:
+                cl.set_proxy(proxy_url)
+            cl.login_by_sessionid(sessionid)
+            login_error = None
+            break
+        except Exception as e:
+            login_error = str(e)
+            rotate_proxy("login_failed")
+            if attempt < LOGIN_MAX_ATTEMPTS:
+                time.sleep(10)
+    if login_error:
+        return {"success": False, "stage": "login", "error": login_error}
 
     try:
         video_path = download_to_temp(presigned_url)
@@ -127,7 +146,7 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
             except Exception as e:
                 story_error = str(e)
                 if attempt < story_max_attempts:
-                    time.sleep(10)  # کمی صبر تا اینستاگرام مدیا رو کامل پردازش کنه
+                    time.sleep(5)  # کمی صبر تا اینستاگرام مدیا رو کامل پردازش کنه
         if story_result:
             result["story"] = story_result
         else:
