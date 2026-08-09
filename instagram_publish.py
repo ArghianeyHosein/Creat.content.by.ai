@@ -6,8 +6,6 @@ import requests
 from fastapi import APIRouter, HTTPException, Header, Request
 from instagrapi import Client
 
-from proxy_utils import get_active_proxy_url, log_error
-
 API_KEY = os.environ.get("API_KEY")
 
 router = APIRouter()
@@ -53,12 +51,16 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     body = await request.json()
-    job_id = body.get("job_id")  # اختیاریه؛ اگه دیسپچر n8n بفرستدش، لاگ‌ها بهش وصل می‌شن
     cookie_b64 = body.get("cookie_b64")
     presigned_url = body.get("presigned_url")
     caption = body.get("caption", "")
     post_feed = bool(body.get("post_feed", False))
     post_story = bool(body.get("post_story", False))
+    # پروکسی دیگه از داخل Python انتخاب/چرخش نمی‌شه — n8n (تنها جایی که حق
+    # تغییر/خواندن دیتابیس رو داره) از قبل پروکسی فعال رو تعیین و تست کرده
+    # و اینجا مستقیم توی بدنه‌ی درخواست می‌فرسته. اگه فرستاده نشه، بدون
+    # پروکسی (مستقیم) تلاش می‌کنیم.
+    proxy_url = body.get("proxy_url")
 
     if not cookie_b64 or not presigned_url:
         raise HTTPException(status_code=400, detail="cookie_b64 و presigned_url الزامی هستن")
@@ -71,42 +73,27 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
         cookies = parse_netscape_cookies(cookie_text)
         sessionid = cookies.get("sessionid")
         if not sessionid:
-            msg = "sessionid توی کوکی‌ها پیدا نشد"
-            log_error("Publishing - Instagram", msg, job_id=job_id, details={"stage": "parse"})
-            return {"success": False, "stage": "parse", "error": msg}
+            return {"success": False, "stage": "parse", "error": "sessionid توی کوکی‌ها پیدا نشد"}
     except Exception as e:
-        log_error("Publishing - Instagram", str(e), job_id=job_id, details={"stage": "parse"})
         return {"success": False, "stage": "parse", "error": str(e)}
 
-    # نکته‌ی مهم: لاگین دیگه retry یا چرخش پروکسی نمی‌کنه. تجربه نشون داد وقتی
-    # اینستاگرام یه چالش امنیتی سطح اکانت (ChallengeRequired) می‌ذاره، عوض کردن
-    # IP بین تلاش‌ها نه‌تنها کمکی نمی‌کنه، بلکه خودش الگوی مشکوکیه (چند IP
-    # پشت‌سرهم برای یه اکانت) که می‌تونه باعث تشدید همون چالش بشه. پس فقط یه‌بار
-    # با همون پروکسی فعلی (ثابت) امتحان می‌کنیم؛ اگه fail شد، بلافاصله و کامل
-    # لاگ می‌کنیم و برمی‌گردیم — بدون تلاش مجدد خودکار.
+    # لاگین دیگه retry یا چرخش پروکسی نمی‌کنه (نه خودکار، نه با دسترسی مستقیم
+    # به دیتابیس). تجربه نشون داد وقتی اینستاگرام یه چالش امنیتی سطح اکانت
+    # (ChallengeRequired) می‌ذاره، عوض کردن IP بین تلاش‌ها کمکی نمی‌کنه و
+    # می‌تونه خودش الگوی مشکوکی بسازه. فقط یه‌بار با پروکسی‌ای که n8n فرستاده
+    # امتحان می‌کنیم؛ نتیجه (موفق/ناموفق) رو کامل توی پاسخ برمی‌گردونیم تا
+    # n8n خودش تصمیم بگیره لاگ کنه یا چرخش پروکسی رو صدا بزنه.
     try:
         cl = Client()
-        proxy_url = get_active_proxy_url()
         if proxy_url:
             cl.set_proxy(proxy_url)
         cl.login_by_sessionid(sessionid)
     except Exception as e:
-        error_msg = str(e)
-        # لاگ رو همین‌جا و بی‌درنگ ثبت می‌کنیم — نه بعد از return — چون اگه
-        # n8n زودتر از رسیدن جواب HTTP timeout بزنه، این تنها جایی می‌مونه
-        # که خطای واقعی ثبت شده باشه (به‌جای اینکه فقط توی لاگ خام Render گم بشه).
-        log_error(
-            "Publishing - Instagram",
-            error_msg,
-            job_id=job_id,
-            details={"stage": "login", "proxy": proxy_url},
-        )
-        return {"success": False, "stage": "login", "error": error_msg}
+        return {"success": False, "stage": "login", "error": str(e)}
 
     try:
         video_path = download_to_temp(presigned_url)
     except Exception as e:
-        log_error("Publishing - Instagram", str(e), job_id=job_id, details={"stage": "download"})
         return {"success": False, "stage": "download", "error": str(e)}
 
     thumb_path = None
@@ -126,12 +113,10 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
             result["feed"] = {"success": True, "media_id": str(media.pk), "code": media.code}
         except Exception as e:
             result["feed"] = {"success": False, "error": str(e)}
-            log_error("Publishing - Instagram", str(e), job_id=job_id, details={"stage": "feed"})
 
     if post_story:
-        # آپلود استوری هم دیگه retry نمی‌کنه (همون منطق: تکرار خودکار می‌تونه
-        # به‌جای رفع مشکل گذرا، رفتار مشکوک اضافه‌ای برای اکانت بسازه). فقط
-        # یه‌بار امتحان می‌کنیم و هر نتیجه‌ای (موفق/ناموفق) رو همون لحظه لاگ می‌کنیم.
+        # آپلود استوری هم دیگه retry نمی‌کنه — فقط یه‌بار امتحان می‌کنیم،
+        # نتیجه رو (موفق یا خطای کامل) توی پاسخ برمی‌گردونیم.
         try:
             if thumb_path:
                 story = cl.video_upload_to_story(video_path, caption, thumbnail=thumb_path)
@@ -140,7 +125,6 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
             result["story"] = {"success": True, "media_id": str(story.pk)}
         except Exception as e:
             result["story"] = {"success": False, "error": str(e)}
-            log_error("Publishing - Instagram", str(e), job_id=job_id, details={"stage": "story"})
 
     for p in (video_path, thumb_path):
         if p:
