@@ -31,6 +31,7 @@ async def test_instagram_login(request: Request, x_api_key: str = Header(None)):
     # پروکسی از داخل Python انتخاب نمی‌شه؛ n8n (تنها جایی که با دیتابیس
     # کار می‌کنه) پروکسی فعال رو مستقیم توی بدنه‌ی درخواست می‌فرسته.
     proxy_url = body.get("proxy_url")
+    device_settings = body.get("device_settings")
     if not cookie_b64:
         raise HTTPException(status_code=400, detail="cookie_b64 الزامیه")
 
@@ -51,6 +52,8 @@ async def test_instagram_login(request: Request, x_api_key: str = Header(None)):
 
     try:
         cl = Client()
+        if device_settings:
+            cl.set_settings(device_settings)
         if proxy_url:
             cl.set_proxy(proxy_url)
         cl.login_by_sessionid(sessionid)
@@ -61,6 +64,12 @@ async def test_instagram_login(request: Request, x_api_key: str = Header(None)):
             "username": account.username,
             "user_id": str(account.pk),
             "full_name": account.full_name,
+            "device_settings": cl.get_settings(),
         }
     except Exception as e:
-        return {"success": False, "stage": "login", "error": str(e)}
+        return {
+            "success": False,
+            "stage": "login",
+            "error": str(e),
+            "device_settings": cl.get_settings(),
+        }
