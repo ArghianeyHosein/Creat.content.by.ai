@@ -89,6 +89,13 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
     # می‌تونه خودش الگوی مشکوکی بسازه. فقط یه‌بار با پروکسی‌ای که n8n فرستاده
     # امتحان می‌کنیم؛ نتیجه (موفق/ناموفق) رو کامل توی پاسخ برمی‌گردونیم تا
     # n8n خودش تصمیم بگیره لاگ کنه یا چرخش پروکسی رو صدا بزنه.
+    def safe_get_settings(client):
+        try:
+            return client.get_settings() if client is not None else None
+        except Exception:
+            return None
+
+    cl = None
     try:
         cl = Client()
         if device_settings:
@@ -106,13 +113,13 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
             "success": False,
             "stage": "login",
             "error": str(e),
-            "device_settings": cl.get_settings(),
+            "device_settings": safe_get_settings(cl),
         }
 
     try:
         video_path = download_to_temp(presigned_url)
     except Exception as e:
-        return {"success": False, "stage": "download", "error": str(e), "device_settings": cl.get_settings()}
+        return {"success": False, "stage": "download", "error": str(e), "device_settings": safe_get_settings(cl)}
 
     thumb_path = None
     try:
@@ -120,7 +127,7 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
     except Exception:
         thumb_path = None  # اگه ساخت thumbnail شکست خورد، بدون اون امتحان می‌کنیم
 
-    result = {"success": True, "feed": None, "story": None, "device_settings": cl.get_settings()}
+    result = {"success": True, "feed": None, "story": None, "device_settings": safe_get_settings(cl)}
 
     if post_feed:
         try:
