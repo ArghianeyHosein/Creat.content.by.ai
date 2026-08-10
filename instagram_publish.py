@@ -61,6 +61,12 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
     # و اینجا مستقیم توی بدنه‌ی درخواست می‌فرسته. اگه فرستاده نشه، بدون
     # پروکسی (مستقیم) تلاش می‌کنیم.
     proxy_url = body.get("proxy_url")
+    # تنظیمات دستگاه (device ID, UUID و غیره) که n8n از دفعه‌ی قبل ذخیره
+    # کرده — اگه بفرسته، همون رو لود می‌کنیم تا از دید اینستاگرام همیشه
+    # همون «دستگاه» باشیم (نه هر بار یه دستگاه تصادفی تازه، که خودش یکی از
+    # محرک‌های چالش امنیتیه). در پایان، تنظیمات فعلی رو توی پاسخ برمی‌گردونیم
+    # تا n8n ذخیره‌ش کنه (چه بار اول باشه چه به‌روزرسانی).
+    device_settings = body.get("device_settings")
 
     if not cookie_b64 or not presigned_url:
         raise HTTPException(status_code=400, detail="cookie_b64 و presigned_url الزامی هستن")
@@ -85,16 +91,28 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
     # n8n خودش تصمیم بگیره لاگ کنه یا چرخش پروکسی رو صدا بزنه.
     try:
         cl = Client()
+        if device_settings:
+            cl.set_settings(device_settings)
         if proxy_url:
             cl.set_proxy(proxy_url)
         cl.login_by_sessionid(sessionid)
     except Exception as e:
-        return {"success": False, "stage": "login", "error": str(e)}
+        # حتی وقتی لاگین fail می‌شه، تنظیمات دستگاه رو برمی‌گردونیم — چون
+        # instagrapi موقع ساخت Client() این تنظیمات (device_id, uuid و غیره)
+        # رو تولید می‌کنه، حتی اگه لاگین بعدش fail بشه. اگه این‌ها رو دور
+        # بریزیم، دفعه‌ی بعد یه دستگاه کاملاً جدید می‌سازیم که دقیقاً همون
+        # الگوی مشکوکیه که می‌خوایم جلوش رو بگیریم.
+        return {
+            "success": False,
+            "stage": "login",
+            "error": str(e),
+            "device_settings": cl.get_settings(),
+        }
 
     try:
         video_path = download_to_temp(presigned_url)
     except Exception as e:
-        return {"success": False, "stage": "download", "error": str(e)}
+        return {"success": False, "stage": "download", "error": str(e), "device_settings": cl.get_settings()}
 
     thumb_path = None
     try:
@@ -102,7 +120,7 @@ async def publish_instagram(request: Request, x_api_key: str = Header(None)):
     except Exception:
         thumb_path = None  # اگه ساخت thumbnail شکست خورد، بدون اون امتحان می‌کنیم
 
-    result = {"success": True, "feed": None, "story": None}
+    result = {"success": True, "feed": None, "story": None, "device_settings": cl.get_settings()}
 
     if post_feed:
         try:
