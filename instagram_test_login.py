@@ -50,6 +50,13 @@ async def test_instagram_login(request: Request, x_api_key: str = Header(None)):
             "found_cookie_names": list(cookies.keys()),
         }
 
+    def safe_get_settings(client):
+        try:
+            return client.get_settings() if client is not None else None
+        except Exception:
+            return None
+
+    cl = None
     try:
         cl = Client()
         if device_settings:
@@ -64,12 +71,12 @@ async def test_instagram_login(request: Request, x_api_key: str = Header(None)):
             "username": account.username,
             "user_id": str(account.pk),
             "full_name": account.full_name,
-            "device_settings": cl.get_settings(),
+            "device_settings": safe_get_settings(cl),
         }
     except Exception as e:
         return {
             "success": False,
             "stage": "login",
             "error": str(e),
-            "device_settings": cl.get_settings(),
+            "device_settings": safe_get_settings(cl),
         }
