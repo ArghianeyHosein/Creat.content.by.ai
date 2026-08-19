@@ -28,6 +28,7 @@ proxy=http://user:pass@ip:port). اگه فرستاده نشه، سرویس بد�
 """
 from instagram_test_login import router as instagram_router
 from instagram_publish import router as instagram_publish_router
+from instagram_login import router as instagram_login_router
 import os
 import re
 import json
@@ -50,6 +51,7 @@ def health():
     return {"status": "ok"}
 app.include_router(instagram_router)
 app.include_router(instagram_publish_router)
+app.include_router(instagram_login_router)
 
 # کلید امنیتی از متغیر محیطی خونده می‌شه (تو تنظیمات Render ست می‌کنیم)
 API_KEY = os.environ.get("API_KEY", "")
