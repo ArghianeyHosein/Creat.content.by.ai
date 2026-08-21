@@ -146,7 +146,7 @@ def cookies_for_platform(platform: str) -> Optional[str]:
 
 
 
-def build_command(platform: str, url: str, output_template: str, proxy_url: Optional[str] = None) -> list:
+def build_command(platform: str, url: str, output_template: str, proxy_url: Optional[str] = None, use_cookies: bool = True) -> list:
     if platform == "youtube":
         cmd = [
             "yt-dlp",
@@ -157,7 +157,7 @@ def build_command(platform: str, url: str, output_template: str, proxy_url: Opti
             "--extractor-args", "youtube:player_client=android,web",
             url,
         ]
-        if YOUTUBE_COOKIES_PATH:
+        if use_cookies and YOUTUBE_COOKIES_PATH:
             cmd += ["--cookies", YOUTUBE_COOKIES_PATH]
         if proxy_url:
             cmd += ["--proxy", proxy_url]
@@ -173,7 +173,7 @@ def build_command(platform: str, url: str, output_template: str, proxy_url: Opti
             "--max-filesize", "50M",
             url,
         ]
-        if INSTAGRAM_COOKIES_PATH:
+        if use_cookies and INSTAGRAM_COOKIES_PATH:
             cmd += ["--cookies", INSTAGRAM_COOKIES_PATH]
         if proxy_url:
             cmd += ["--proxy", proxy_url]
@@ -182,7 +182,7 @@ def build_command(platform: str, url: str, output_template: str, proxy_url: Opti
     raise HTTPException(status_code=400, detail="Unsupported URL (only YouTube and Instagram)")
 
 
-def build_info_command(platform: str, url: str, proxy_url: Optional[str] = None) -> list:
+def build_info_command(platform: str, url: str, proxy_url: Optional[str] = None, use_cookies: bool = True) -> list:
     """
     مثل build_command ولی به‌جای دانلود واقعی فایل، فقط متادیتا (کپشن،
     هشتگ و ...) رو به‌صورت JSON از yt-dlp می‌گیره. --skip-download یعنی
@@ -199,7 +199,7 @@ def build_info_command(platform: str, url: str, proxy_url: Optional[str] = None)
         url,
     ]
     cookies_path = cookies_for_platform(platform)
-    if cookies_path:
+    if use_cookies and cookies_path:
         cmd += ["--cookies", cookies_path]
     if proxy_url:
         cmd += ["--proxy", proxy_url]
@@ -225,6 +225,7 @@ def download_video(
     background_tasks: BackgroundTasks,
     x_api_key: str = Header(default=""),
     proxy: Optional[str] = Query(default=None, description="پروکسی که n8n از قبل تعیین/تست کرده، مثلا http://user:pass@ip:port"),
+    use_cookies: bool = Query(default=True, description="اگه false باشه، حتی با وجود کوکی ست‌شده، بدون کوکی تلاش می‌کنه"),
 ):
     # چک کلید امنیتی
     if not API_KEY or x_api_key != API_KEY:
@@ -237,7 +238,7 @@ def download_video(
     file_id = str(uuid.uuid4())
     output_template = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
-    cmd = build_command(platform, url, output_template, proxy)
+    cmd = build_command(platform, url, output_template, proxy, use_cookies)
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=180)
@@ -267,6 +268,7 @@ def get_info(
     url: str = Query(...),
     x_api_key: str = Header(default=""),
     proxy: Optional[str] = Query(default=None, description="پروکسی که n8n از قبل تعیین/تست کرده، مثلا http://user:pass@ip:port"),
+    use_cookies: bool = Query(default=True, description="اگه false باشه، حتی با وجود کوکی ست‌شده، بدون کوکی تلاش می‌کنه"),
 ):
     """
     فقط متادیتای محتوا (کپشن، هشتگ) رو برمی‌گردونه، بدون دانلود فایل.
@@ -280,7 +282,7 @@ def get_info(
     if platform == "unknown":
         raise HTTPException(status_code=400, detail="Only YouTube and Instagram URLs are supported")
 
-    cmd = build_info_command(platform, url, proxy)
+    cmd = build_info_command(platform, url, proxy, use_cookies)
 
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
